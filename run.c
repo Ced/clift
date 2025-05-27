@@ -19,7 +19,7 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-#define SEQUENCE_CHUNK_MAX_LEN 2
+#define SEQUENCE_CHUNK_MAX_LEN 512
 
 // ----------------------------------------------------------------------------
 // transformer_t model
@@ -394,8 +394,6 @@ float* forward(
     }
   }
 
-  print_vector(embedding_dim, embedding[0], 3, "embed");
-
   // forward all the layers
   for (int l = 0; l < layer_count; l++) {
 
@@ -408,7 +406,6 @@ float* forward(
         embedding_dim
       );
     }
-    if (l < 2) print_vector(embedding_dim, mha_norm[0], 3, "norm");
 
     // qkv matmuls for this position
     for (int h = 0; h < kv_head_count; h++) {
@@ -424,7 +421,7 @@ float* forward(
         }
       }
     }
-    if (l < 2) print_vector(embedding_dim, (float*)mha_q, 3, "q");
+
     for (int h = 0; h < kv_head_count; h++) {
       for (int t = 0; t < sequence_len; t++) {
         matmul(
@@ -436,7 +433,8 @@ float* forward(
         );
       }
     }
-    if (l < 2) {
+    
+    /*if (l < 2) {
       for (int h = 0; h < kv_head_count; h++) {
         for (int t = 0; t < sequence_len; t++) {
           for (int e = 0; e < head_dim; e++) {
@@ -445,7 +443,8 @@ float* forward(
         }
       }
       print_vector(kv_dim, (float*)mha_att[0], 3, "k");
-    }
+    }*/
+  
     for (int h = 0; h < kv_head_count; h++) {
       for (int t = 0; t < sequence_len; t++) {
         matmul(
@@ -456,16 +455,6 @@ float* forward(
             head_dim
         );
       }
-    }
-    if (l < 2) {
-      for (int h = 0; h < kv_head_count; h++) {
-        for (int t = 0; t < sequence_len; t++) {
-          for (int e = 0; e < head_dim; e++) {
-            mha_att[t][h * head_dim + e] = v_cache[l][h][pos + t][e];
-          }
-        }
-      }
-      print_vector(kv_dim, (float*)mha_att[0], 3, "v");
     }
 
     // RoPE q: complex-valued rotate q in each head
@@ -485,7 +474,6 @@ float* forward(
         }
       }
     }
-    if (l < 2) print_vector(embedding_dim, (float*)mha_q, 3, "q");
 
     // RoPE k: complex-valued rotate k in each head
     for (int h = 0; h < kv_head_count; h++) {
@@ -501,16 +489,6 @@ float* forward(
           k_cache[l][h][pos + t][e + 1] = v0 * fci + v1 * fcr;
         }
       }
-    }
-    if (l < 2) {
-      for (int h = 0; h < kv_head_count; h++) {
-        for (int t = 0; t < sequence_len; t++) {
-          for (int e = 0; e < head_dim; e++) {
-            mha_att[t][h * head_dim + e] = k_cache[l][h][pos + t][e];
-          }
-        }
-      }
-      print_vector(kv_dim, (float*)mha_att[0], 3, "k");
     }
 
     // multihead attention. iterate over all heads
@@ -554,8 +532,6 @@ float* forward(
       }
     }
 
-    if (l < 2) print_vector(embedding_dim, (float*)mha_att, 3, "att");
-
     // final matmul to get the output of the attention
     for (int t = 0; t < sequence_len; t++) {
       matmul(
@@ -566,7 +542,6 @@ float* forward(
           embedding_dim
       );
     }
-    if (l < 2) print_vector(embedding_dim, (float*)mha_out, 3, "out");
 
     // residual connection back into x
     for (int t = 0; t < sequence_len; t++) {
@@ -635,7 +610,6 @@ float* forward(
         embedding[t][e] += ffn_out[t][e];
       }
     }
-    if (l < 2) print_vector(embedding_dim, embedding[0], 3, "embed");
   }
 
   // final rmsnorm
@@ -658,7 +632,6 @@ float* forward(
         vocabulary_len
     );
   }
-  print_vector(vocabulary_len, (float*)logits, 3, "logits");
 
   return &logits[sequence_len - 1][0];
 }
@@ -679,7 +652,6 @@ float* driver(transformer_t* transformer, int sequence_len, int* sequence, int p
   int kv_dim = head_dim * kv_head_count;
   int hidden_dim = c->hidden_dim;
  
-  printf("\n");
   return forward(
       transformer,
       sequence_len,
@@ -733,7 +705,7 @@ float* driver(transformer_t* transformer, int sequence_len, int* sequence, int p
 
 float* forward_one(transformer_t* transformer, int sequence_len, int* sequence, int pos) {
   int token = sequence[0];
- printf("\n"); 
+
   // a few convenience variables
   configuration_t* p = &transformer->config;
   parameter_set_t* w = &transformer->params;
@@ -751,14 +723,11 @@ float* forward_one(transformer_t* transformer, int sequence_len, int* sequence, 
   float* content_row = w->embedding_weight + token * embedding_dim;
   memcpy(embedding, content_row, embedding_dim * sizeof(*embedding));
 
-  print_vector(embedding_dim, embedding, 3, "embed");
-
   // forward all the layers
   for (unsigned long long l = 0; l < p->layer_count; l++) {
 
     // attention rmsnorm
     rmsnorm(s->mha_norm, embedding, w->mha_norm_weight + l * embedding_dim, embedding_dim);
-    if (l < 2) print_vector(embedding_dim, s->mha_norm, 3, "norm");
 
     // key and value point to the kv cache
     int loff = l * p->context_len * kv_dim; // kv cache layer offset for convenience
@@ -769,9 +738,6 @@ float* forward_one(transformer_t* transformer, int sequence_len, int* sequence, 
     matmul(s->mha_q, s->mha_norm, w->mha_q_weight + l * embedding_dim * embedding_dim, embedding_dim, embedding_dim);
     matmul(s->mha_k_act, s->mha_norm, w->mha_k_weight + l * embedding_dim * kv_dim, embedding_dim, kv_dim);
     matmul(s->mha_v_act, s->mha_norm, w->mha_v_weight + l * embedding_dim * kv_dim, embedding_dim, kv_dim);
-    if (l < 2) print_vector(embedding_dim, s->mha_q, 3, "q");
-    if (l < 2) print_vector(kv_dim, s->mha_k_act, 3, "k");
-    if (l < 2) print_vector(kv_dim, s->mha_v_act, 3, "v");
 
     // RoPE relative positional encoding: complex-valued rotate q and k in each
     // head
@@ -791,8 +757,6 @@ float* forward_one(transformer_t* transformer, int sequence_len, int* sequence, 
         vec[i + 1] = v0 * fci + v1 * fcr;
       }
     }
-    if (l < 2) print_vector(embedding_dim, s->mha_q, 3, "q");
-    if (l < 2) print_vector(embedding_dim, s->mha_k_act, 3, "k");
 
     // multihead attention. iterate over all heads
     int h;
@@ -834,11 +798,9 @@ float* forward_one(transformer_t* transformer, int sequence_len, int* sequence, 
         }
       }
     }
-    if (l < 2) print_vector(embedding_dim, s->mha_att, 3, "att");
 
     // final matmul to get the output of the attention
     matmul(s->mha_out, s->mha_blend, w->mha_out_weight + l * embedding_dim * embedding_dim, embedding_dim, embedding_dim);
-    if (l < 2) print_vector(embedding_dim, s->mha_out, 3, "out");
 
     // residual connection back into x
     for (int i = 0; i < embedding_dim; i++) {
@@ -870,7 +832,6 @@ float* forward_one(transformer_t* transformer, int sequence_len, int* sequence, 
     for (int i = 0; i < embedding_dim; i++) {
       embedding[i] += s->ffn_out[i];
     }
-    if (l < 2) print_vector(embedding_dim, embedding, 3, "embed");
   }
 
   // final rmsnorm
@@ -878,7 +839,6 @@ float* forward_one(transformer_t* transformer, int sequence_len, int* sequence, 
 
   // classifier into logits
   matmul(s->logits, embedding, w->out_weight, p->embedding_dim, p->vocabulary_len);
-  print_vector(p->vocabulary_len, s->logits, 3, "logits");
   return s->logits;
 }
 
