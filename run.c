@@ -290,52 +290,69 @@ void print_vector(size_t size, float* vector, size_t sample_size, char* name) {
 // ----------------------------------------------------------------------------
 // neural net blocks; the dynamics of the transformer_t
 
-void rmsnorm(float* o, float* x, float* weight, int size) {
-  // calculate sum of squares
-  float ss = 0.0f;
-  for (int j = 0; j < size; j++) {
-    ss += x[j] * x[j];
-  }
-  ss /= size;
-  ss += 1e-5f;
-  ss = 1.0f / sqrtf(ss);
-  // normalize and scale
-  for (int j = 0; j < size; j++) {
-    o[j] = weight[j] * (ss * x[j]);
+void rmsnorm(
+    int row_count,
+    int col_count,
+    float y[row_count][col_count],
+    float x[row_count][col_count],
+    float w[col_count],
+    float epsilon
+) {
+  for (int i = 0; i < row_count; i++) {
+    // calculate sum of squares
+    float ss = 0.0f;
+    for (int j = 0; j < col_count; j++) {
+      ss += x[i][j] * x[i][j];
+    }
+    ss /= col_count;
+    ss += epsilon;
+    ss = 1.0f / sqrtf(ss);
+    // normalize and scale
+    for (int j = 0; j < col_count; j++) {
+      y[i][j] = w[j] * (ss * x[i][j]);
+    }
   }
 }
 
-void softmax(float* x, int size) {
-  // find max value (for numerical stability)
-  float max_val = x[0];
-  for (int i = 1; i < size; i++) {
-    if (x[i] > max_val) {
-      max_val = x[i];
+void softmax(
+    int row_count, int col_count, int col_stride, float x[row_count][col_stride]
+) {
+  for (int i = 0; i < row_count; i++) {
+    // find max value (for numerical stability)
+    float max_val = x[i][0];
+    for (int j = 1; j < i + col_count; j++) {
+      if (x[i][j] > max_val) {
+        max_val = x[i][j];
+      }
     }
-  }
-  // exp and sum
-  float sum = 0.0f;
-  for (int i = 0; i < size; i++) {
-    x[i] = expf(x[i] - max_val);
-    sum += x[i];
-  }
-  // normalize
-  for (int i = 0; i < size; i++) {
-    x[i] /= sum;
+    // exp and sum
+    float sum = 0.0f;
+    for (int j = 0; j < i + col_count; j++) {
+      x[i][j] = expf(x[i][j] - max_val);
+      sum += x[i][j];
+    }
+    // normalize
+    for (int j = 0; j < i + col_count; j++) {
+      x[i][j] /= sum;
+    }
   }
 }
 
-void matmul(float* xout, float* x, float* w, int n, int d) {
-  // W (d,n) @ x (n,) -> xout (d,)
-  // by far the most amount of time is spent inside this little function
-  int i;
-#pragma omp parallel for private(i)
-  for (i = 0; i < d; i++) {
-    float val = 0.0f;
-    for (int j = 0; j < n; j++) {
-      val += w[i * n + j] * x[j];
+void matmul(
+    int row_count,
+    int col_count,
+    int red_count,
+    float y[row_count][col_count],
+    float x[row_count][red_count],
+    float w[col_count][red_count]
+) {
+  for (int i = 0; i < row_count; i++) {
+    for (int j = 0; j < col_count; j++) {
+      y[i][j] = 0.0f;
+      for (int k = 0; k < red_count; k++) {
+        y[i][j] += x[i][k] * w[j][k];
+      }
     }
-    xout[i] = val;
   }
 }
 
@@ -358,6 +375,9 @@ float* forward(
   int q_dim,
   int kv_dim,
   int hidden_dim,
+
+  float epsilon,
+
   float embedding_weight[restrict vocabulary_len][embedding_dim],
   float mha_norm_weight[restrict layer_count][embedding_dim],
   float mha_q_weight[restrict layer_count][kv_head_count][q_head_per_kv_head_count][head_dim][embedding_dim],
@@ -398,40 +418,38 @@ float* forward(
   for (int l = 0; l < layer_count; l++) {
 
     // attention rmsnorm
-    for (int t = 0; t < sequence_len; t++) {
-      rmsnorm(
-        &mha_norm[t][0],
-        &embedding[t][0],
-        &mha_norm_weight[l][0],
-        embedding_dim
-      );
-    }
+    rmsnorm(
+        sequence_len,
+        embedding_dim,
+        mha_norm,
+        embedding,
+        mha_norm_weight[l],
+        epsilon
+    );
 
     // qkv matmuls for this position
     for (int h = 0; h < kv_head_count; h++) {
       for (int g = 0; g < q_head_per_kv_head_count; g++) {
-        for (int t = 0; t < sequence_len; t++) {
-          matmul(
-              &mha_q[h][g][t][0],
-              &mha_norm[t][0],
-              &mha_q_weight[l][h][g][0][0],
-              embedding_dim,
-              head_dim
-          );
-        }
+        matmul(
+            sequence_len,
+            head_dim,
+            embedding_dim,
+            mha_q[h][g],
+            mha_norm,
+            mha_q_weight[l][h][g]
+        );
       }
     }
 
     for (int h = 0; h < kv_head_count; h++) {
-      for (int t = 0; t < sequence_len; t++) {
-        matmul(
-            &k_cache[l][h][pos + t][0],
-            &mha_norm[t][0],
-            &mha_k_weight[l][h][0][0],
-            embedding_dim,
-            head_dim
-        );
-      }
+      matmul(
+          sequence_len,
+          head_dim,
+          embedding_dim,
+          k_cache[l][h] + pos,
+          mha_norm,
+          mha_k_weight[l][h]
+      );
     }
     
     /*if (l < 2) {
@@ -446,15 +464,14 @@ float* forward(
     }*/
   
     for (int h = 0; h < kv_head_count; h++) {
-      for (int t = 0; t < sequence_len; t++) {
-        matmul(
-            &v_cache[l][h][pos + t][0],
-            &mha_norm[t][0],
-            &mha_v_weight[l][h][0][0],
-            embedding_dim,
-            head_dim
-        );
-      }
+      matmul(
+          sequence_len,
+          head_dim,
+          embedding_dim,
+          v_cache[l][h] + pos,
+          mha_norm,
+          mha_v_weight[l][h]
+      );
     }
 
     // RoPE q: complex-valued rotate q in each head
@@ -504,10 +521,17 @@ float* forward(
             }
             mha_score[h][g][t][p] /= sqrtf(head_dim);
           }
+        }
 
-          // softmax the scores to get attention weights
-          softmax(&mha_score[h][g][t][0], pos + t + 1);
+        // softmax the scores to get attention weights
+        softmax(
+            sequence_len,
+            pos + 1,
+            context_len,
+            mha_score[h][g]
+        );
 
+        for (int t = 0; t < sequence_len; t++) {
           // weighted sum of the values
           for (int e = 0; e < head_dim; e++) {
             mha_blend[h][g][t][e] = 0.0f;
@@ -533,15 +557,14 @@ float* forward(
     }
 
     // final matmul to get the output of the attention
-    for (int t = 0; t < sequence_len; t++) {
-      matmul(
-          &mha_out[t][0],
-          &mha_att[t][0],
-          &mha_out_weight[l][0][0],
-          embedding_dim,
-          embedding_dim
-      );
-    }
+    matmul(
+        sequence_len,
+        embedding_dim,
+        embedding_dim,
+        mha_out,
+        mha_att,
+        mha_out_weight[l]
+    );
 
     // residual connection back into x
     for (int t = 0; t < sequence_len; t++) {
@@ -551,37 +574,35 @@ float* forward(
     }
 
     // ffn rmsnorm
-    for (int t = 0; t < sequence_len; t++) {
-      rmsnorm(
-        &ffn_norm[t][0],
-        &embedding[t][0],
-        &ffn_norm_weight[l][0],
-        embedding_dim
-      );
-    }
+    rmsnorm(
+        sequence_len,
+        embedding_dim,
+        ffn_norm,
+        embedding,
+        ffn_norm_weight[l],
+        epsilon
+    );
 
     // Now for FFN in PyTorch we have:
     // self.ffn_out_weight(F.silu(self.ffn_fc_weight(x)) *
     // self.ffn_up_weight(x)) first calculate self.ffn_fc_weight(x) and
     // self.ffn_up_weight(x)
-    for (int t = 0; t < sequence_len; t++) {
-      matmul(
-          &ffn_fc[t][0],
-          &ffn_norm[t][0],
-          &ffn_fc_weight[l][0][0],
-          embedding_dim,
-          hidden_dim
-      );
-    }
-    for (int t = 0; t < sequence_len; t++) {
-      matmul(
-          &ffn_up[t][0],
-          &ffn_norm[t][0],
-          &ffn_up_weight[l][0][0],
-          embedding_dim,
-          hidden_dim
-      );
-    }
+    matmul(
+        sequence_len,
+        hidden_dim,
+        embedding_dim,
+        ffn_fc,
+        ffn_norm,
+        ffn_fc_weight[l]
+    );
+    matmul(
+        sequence_len,
+        hidden_dim,
+        embedding_dim,
+        ffn_up,
+        ffn_norm,
+        ffn_up_weight[l]
+    );
 
     // SwiGLU non-linearity
     for (int t = 0; t < sequence_len; t++) {
@@ -594,15 +615,14 @@ float* forward(
     }
 
     // final matmul to get the output of the ffn
-    for (int t = 0; t < sequence_len; t++) {
-      matmul(
-          &ffn_out[t][0],
-          &ffn_fc[t][0],
-          &ffn_out_weight[l][0][0],
-          hidden_dim,
-          embedding_dim
-      );
-    }
+    matmul(
+        sequence_len,
+        embedding_dim,
+        hidden_dim,
+        ffn_out,
+        ffn_fc,
+        ffn_out_weight[l]
+    );
 
     // residual connection
     for (int t = 0; t < sequence_len; t++) {
@@ -613,25 +633,24 @@ float* forward(
   }
 
   // final rmsnorm
-  for (int t = 0; t < sequence_len; t++) {
-    rmsnorm(
-        &embedding[t][0],
-        &embedding[t][0],
-        &out_norm_weight[0],
-        embedding_dim
-    );
-  }
+  rmsnorm(
+      sequence_len,
+      embedding_dim,
+      embedding,
+      embedding,
+      out_norm_weight,
+      epsilon
+  );
 
   // classifier into logits
-  for (int t = 0; t < sequence_len; t++) {
-    matmul(
-        &logits[t][0],
-        &embedding[t][0],
-        &out_weight[0][0],
-        embedding_dim,
-        vocabulary_len
-    );
-  }
+  matmul(
+      sequence_len,
+      vocabulary_len,
+      embedding_dim,
+      logits,
+      embedding,
+      out_weight
+  );
 
   return &logits[sequence_len - 1][0];
 }
@@ -667,6 +686,9 @@ float* driver(transformer_t* transformer, int sequence_len, int* sequence, int p
       q_dim,
       kv_dim,
       hidden_dim,
+
+      1e-5f,
+
       (float (*)[embedding_dim])p->embedding_weight,
       (float (*)[embedding_dim])p->mha_norm_weight,
       (float (*)[kv_head_count][q_head_per_kv_head_count][head_dim][embedding_dim])p->mha_q_weight,
@@ -702,145 +724,6 @@ float* driver(transformer_t* transformer, int sequence_len, int* sequence, int p
 //----------------------------------------------------------------------------
 //----------------------------------------------------------------------------
 //----------------------------------------------------------------------------
-
-float* forward_one(transformer_t* transformer, int sequence_len, int* sequence, int pos) {
-  int token = sequence[0];
-
-  // a few convenience variables
-  configuration_t* p = &transformer->config;
-  parameter_set_t* w = &transformer->params;
-  state_t* s = &transformer->state;
-  float* embedding = s->embedding;
-  int embedding_dim = p->embedding_dim;
-  int kv_dim = (p->embedding_dim * p->kv_head_count) / p->q_head_count;
-  int q_head_per_kv_head_count =
-      p->q_head_count /
-      p->kv_head_count; // integer multiplier of the kv sharing in multiquery
-  int hidden_dim = p->hidden_dim;
-  int head_dim = embedding_dim / p->q_head_count;
-
-  // copy the token embedding into x
-  float* content_row = w->embedding_weight + token * embedding_dim;
-  memcpy(embedding, content_row, embedding_dim * sizeof(*embedding));
-
-  // forward all the layers
-  for (unsigned long long l = 0; l < p->layer_count; l++) {
-
-    // attention rmsnorm
-    rmsnorm(s->mha_norm, embedding, w->mha_norm_weight + l * embedding_dim, embedding_dim);
-
-    // key and value point to the kv cache
-    int loff = l * p->context_len * kv_dim; // kv cache layer offset for convenience
-    s->mha_k_act = s->k_cache + loff + pos * kv_dim;
-    s->mha_v_act = s->v_cache + loff + pos * kv_dim;
-
-    // qkv matmuls for this position
-    matmul(s->mha_q, s->mha_norm, w->mha_q_weight + l * embedding_dim * embedding_dim, embedding_dim, embedding_dim);
-    matmul(s->mha_k_act, s->mha_norm, w->mha_k_weight + l * embedding_dim * kv_dim, embedding_dim, kv_dim);
-    matmul(s->mha_v_act, s->mha_norm, w->mha_v_weight + l * embedding_dim * kv_dim, embedding_dim, kv_dim);
-
-    // RoPE relative positional encoding: complex-valued rotate q and k in each
-    // head
-    for (int i = 0; i < embedding_dim; i += 2) {
-      int head = i % head_dim;
-      float freq = 1.0f / powf(10000.0f, head / (float)head_dim);
-      float val = pos * freq;
-      float fcr = cosf(val);
-      float fci = sinf(val);
-      int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
-      for (int v = 0; v < rotn; v++) {
-        float* vec =
-            v == 0 ? s->mha_q : s->mha_k_act; // the vector to rotate (query or key)
-        float v0 = vec[i];
-        float v1 = vec[i + 1];
-        vec[i] = v0 * fcr - v1 * fci;
-        vec[i + 1] = v0 * fci + v1 * fcr;
-      }
-    }
-
-    // multihead attention. iterate over all heads
-    int h;
-#pragma omp parallel for private(h)
-    for (h = 0; h < p->q_head_count; h++) {
-      // get the query vector for this head
-      float* q = s->mha_q + h * head_dim;
-      // attention scores for this head
-      float* att = s->mha_score + h * p->context_len;
-      // iterate over all timesteps, including the current one
-      for (int t = 0; t <= pos; t++) {
-        // get the key vector for this head and at this timestep
-        float* k = s->k_cache + loff + t * kv_dim + (h / q_head_per_kv_head_count) * head_dim;
-        // calculate the attention score as the dot product of q and k
-        float score = 0.0f;
-        for (int i = 0; i < head_dim; i++) {
-          score += q[i] * k[i];
-        }
-        score /= sqrtf(head_dim);
-        // save the score to the attention buffer
-        att[t] = score;
-      }
-
-      // softmax the scores to get attention params, from 0..pos inclusively
-      softmax(att, pos + 1);
-
-      // weighted sum of the values, store back into xb
-      float* mha_blend = s->mha_blend + h * head_dim;
-      memset(mha_blend, 0, head_dim * sizeof(float));
-      for (int t = 0; t <= pos; t++) {
-        // get the value vector for this head and at this timestep
-        float* v =
-            s->v_cache + loff + t * kv_dim + (h / q_head_per_kv_head_count) * head_dim;
-        // get the attention weight for this timestep
-        float a = att[t];
-        // accumulate the weighted value into mha_blend
-        for (int i = 0; i < head_dim; i++) {
-          mha_blend[i] += a * v[i];
-        }
-      }
-    }
-
-    // final matmul to get the output of the attention
-    matmul(s->mha_out, s->mha_blend, w->mha_out_weight + l * embedding_dim * embedding_dim, embedding_dim, embedding_dim);
-
-    // residual connection back into x
-    for (int i = 0; i < embedding_dim; i++) {
-      embedding[i] += s->mha_out[i];
-    }
-
-    // ffn rmsnorm
-    rmsnorm(s->ffn_norm, embedding, w->ffn_norm_weight + l * embedding_dim, embedding_dim);
-
-    // Now for FFN in PyTorch we have: self.ffn_out_weight(F.silu(self.ffn_fc_weight(x)) * self.ffn_up_weight(x))
-    // first calculate self.ffn_fc_weight(x) and self.ffn_up_weight(x)
-    matmul(s->ffn_fc, s->ffn_norm, w->ffn_fc_weight + l * embedding_dim * hidden_dim, embedding_dim, hidden_dim);
-    matmul(s->ffn_up, s->ffn_norm, w->ffn_up_weight + l * embedding_dim * hidden_dim, embedding_dim, hidden_dim);
-
-    // SwiGLU non-linearity
-    for (int i = 0; i < hidden_dim; i++) {
-      float val = s->ffn_fc[i];
-      // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-      val *= (1.0f / (1.0f + expf(-val)));
-      // elementwise multiply with ffn_up_weight(x)
-      val *= s->ffn_up[i];
-      s->ffn_fc[i] = val;
-    }
-
-    // final matmul to get the output of the ffn
-    matmul(s->ffn_out, s->ffn_fc, w->ffn_out_weight + l * embedding_dim * hidden_dim, hidden_dim, embedding_dim);
-
-    // residual connection
-    for (int i = 0; i < embedding_dim; i++) {
-      embedding[i] += s->ffn_out[i];
-    }
-  }
-
-  // final rmsnorm
-  rmsnorm(embedding, embedding, w->out_norm_weight, embedding_dim);
-
-  // classifier into logits
-  matmul(s->logits, embedding, w->out_weight, p->embedding_dim, p->vocabulary_len);
-  return s->logits;
-}
 
 // ----------------------------------------------------------------------------
 // The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
@@ -982,7 +865,8 @@ void encode(
   // create a temporary buffer that will store merge candidates of always tmha_out_weight
   // consecutive tokens *2 for concat, +1 for null terminator +2 for UTF8 (in
   // case max_token_length is 1)
-  char* str_buffer = malloc((t->max_token_length * 2 + 1 + 2) * sizeof(char));
+  size_t str_buffer_size = (t->max_token_length * 2 + 1 + 2) * sizeof(char);
+  char* str_buffer = malloc(str_buffer_size);
   size_t str_len = 0;
 
   // start at 0 tokens
@@ -1063,7 +947,7 @@ void encode(
 
     for (int i = 0; i < (*n_tokens - 1); i++) {
       // check if we can merge the pair (tokens[i], tokens[i+1])
-      sprintf(str_buffer, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i + 1]]);
+      snprintf(str_buffer, str_buffer_size, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i + 1]]);
       int id = str_lookup(str_buffer, t->sorted_vocab, t->vocabulary_len);
       if (id != -1 && t->vocab_scores[id] > best_score) {
         // this merge pair exists in vocab! record its score and position
@@ -1233,7 +1117,12 @@ int sample(Sampler* sampler, float* logits) {
       logits[q] /= sampler->temperature;
     }
     // apply softmax to the logits to get the probabilities for next token
-    softmax(logits, sampler->vocabulary_len);
+    softmax(
+        1,
+        sampler->vocabulary_len,
+        sampler->vocabulary_len,
+        (float (*)[sampler->vocabulary_len])logits
+    );
     // flip a (float) coin (this is our source of entropy for sampling)
     float coin = random_f32(&sampler->rng_state);
     // we sample from this distribution to get the next token
@@ -1372,93 +1261,6 @@ void generate(
     );
   }
 
-  printf("=============================================================================================================================\n");
-
-  free(sequence);
-}
-
-void generate_one_by_one(
-    transformer_t* transformer,
-    Tokenizer* tokenizer,
-    Sampler* sampler,
-    char* prompt,
-    int steps
-) {
-  char* empty_prompt = "";
-  if (prompt == NULL) {
-    prompt = empty_prompt;
-  }
-
-  // encode the (string) prompt into tokens sequence
-  int sequence_len = 0;
-  int* sequence = malloc((strlen(prompt) + 3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
-  encode(tokenizer, prompt, 1, 0, sequence, &sequence_len);
-  if (sequence_len < 1) {
-    fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
-    exit(EXIT_FAILURE);
-  }
-
-  // Print the prompt tokens
-  printf("Sequence (%d tokens):\n", sequence_len);
-  for (int i = 0; i < sequence_len; i++) {
-    printf("%d ", sequence[i]);
-  }
-  printf("\n");
-
-  // start the main loop
-  long start = 0; // used to time our code, only initialized after first iteration
-
-  int next; // will store the next token in the sequence
-  int token = sequence[0]; // kick off with the first token in the prompt
-  int pos = 0;                  // position in the sequence
- 
-  size_t generated_count = 0; // number of tokens generated so far  
-  size_t past = 0; // number of tokens already processed
-
-  while (pos < steps) {
-
-    // forward the transformer to get logits for the next token
-    float* logits = forward_one(transformer, 1, &token, pos);
-
-    // advance the state machine
-    if (pos < sequence_len - 1) {
-      // if we are still processing the input prompt, force the next prompt
-      // token
-      next = sequence[pos + 1];
-    } else {
-      // otherwise sample the next token from the logits
-      next = sample(sampler, logits);
-    }
-    pos++;
-
-    // data-dependent terminating condition: the BOS (=1) token delimits
-    // sequences
-    if (next == 1) {
-      break;
-    }
-
-    // print the token as string, decode it with the Tokenizer object
-    char* piece = decode(tokenizer, token, next);
-    safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
-    fflush(stdout);
-    token = next;
-
-    // init the timer here because the first iteration can be slower
-    if (start == 0) {
-      start = time_in_ms();
-    }
-  }
-  printf("\n");
-
-  // report achieved tok/s (pos-1 because the timer starts after first
-  // iteration)
-  if (pos > 1) {
-    long end = time_in_ms();
-    fprintf(
-        stderr, "achieved tok/s: %f\n", (pos - 1) / (double)(end - start) * 1000
-    );
-  }
-
   free(sequence);
 }
 
@@ -1582,7 +1384,6 @@ int main(int argc, char* argv[]) {
   );
 
   // run!
-  generate_one_by_one(&transformer, &tokenizer, &sampler, prompt, steps);
   generate(&transformer, &tokenizer, &sampler, prompt, steps);
 
   // memory and file handles cleanup
