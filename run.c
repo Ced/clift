@@ -88,7 +88,7 @@ void state_malloc(state_t* s, configuration_t* p) {
   size_t kv_dim = (p->embedding_dim * p->kv_head_count) / p->q_head_count;
   size_t embed_len = SEQUENCE_CHUNK_MAX_LEN * p->embedding_dim;
   size_t hidden_len = SEQUENCE_CHUNK_MAX_LEN * p->hidden_dim;
-  size_t score_len = p->context_len * p->q_head_count;
+  size_t score_len = p->q_head_count * p->context_len * p->context_len;
   size_t cache_len = p->context_len * p->layer_count * kv_dim;
   size_t logits_len = SEQUENCE_CHUNK_MAX_LEN * p->vocabulary_len;
 
@@ -1582,8 +1582,8 @@ int main(int argc, char* argv[]) {
   );
 
   // run!
-  generate(&transformer, &tokenizer, &sampler, prompt, steps);
   generate_one_by_one(&transformer, &tokenizer, &sampler, prompt, steps);
+  generate(&transformer, &tokenizer, &sampler, prompt, steps);
 
   // memory and file handles cleanup
   free_sampler(&sampler);
