@@ -356,6 +356,26 @@ void matmul(
   }
 }
 
+void rope(
+    int row_count,
+    int col_count,
+    float x[row_count][col_count],
+    int pos
+) {
+  for (int i = 0; i < row_count; i++) {
+    for (int j = 0; j < col_count; j += 2) {
+      float freq = 1.0f / powf(10000.0f, j / (float)col_count);
+      float val = (pos + i) * freq;
+      float fcr = cosf(val);
+      float fci = sinf(val);
+      float v0 = x[i][j];
+      float v1 = x[i][j + 1];
+      x[i][j] = v0 * fcr - v1 * fci;
+      x[i][j + 1] = v0 * fci + v1 * fcr;
+    }
+  }
+}
+
 //----------------------------------------------------------------------------
 //----------------------------------------------------------------------------
 //----------------------------------------------------------------------------
@@ -477,7 +497,7 @@ float* forward(
     // RoPE q: complex-valued rotate q in each head
     for (int h = 0; h < kv_head_count; h++) {
       for (int g = 0; g < q_head_per_kv_head_count; g++) {
-        for (int t = 0; t < sequence_len; t++) {
+        /*for (int t = 0; t < sequence_len; t++) {
           for (int e = 0; e < head_dim; e += 2) {
             float freq = 1.0f / powf(10000.0f, e / (float)head_dim);
             float val = (pos + t) * freq;
@@ -488,13 +508,19 @@ float* forward(
             mha_q[h][g][t][e] = v0 * fcr - v1 * fci;
             mha_q[h][g][t][e + 1] = v0 * fci + v1 * fcr;
           }
-        }
+        }*/
+        rope(
+          sequence_len,
+          head_dim,
+          mha_q[h][g],
+          pos
+        );
       }
     }
 
     // RoPE k: complex-valued rotate k in each head
     for (int h = 0; h < kv_head_count; h++) {
-      for (int t = 0; t < sequence_len; t++) {
+      /*for (int t = 0; t < sequence_len; t++) {
         for (int e = 0; e < head_dim; e += 2) {
           float freq = 1.0f / powf(10000.0f, e / (float)head_dim);
           float val = (pos + t) * freq;
@@ -505,7 +531,13 @@ float* forward(
           k_cache[l][h][pos + t][e] = v0 * fcr - v1 * fci;
           k_cache[l][h][pos + t][e + 1] = v0 * fci + v1 * fcr;
         }
-      }
+      }*/
+      rope(
+          sequence_len,
+          head_dim,
+          k_cache[l][h] + pos,
+          pos
+      );
     }
 
     // multihead attention. iterate over all heads
@@ -670,7 +702,7 @@ float* driver(transformer_t* transformer, int sequence_len, int* sequence, int p
   int q_dim = head_dim * q_head_count;
   int kv_dim = head_dim * kv_head_count;
   int hidden_dim = c->hidden_dim;
- 
+
   return forward(
       transformer,
       sequence_len,
