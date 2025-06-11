@@ -425,7 +425,8 @@ float* forward(
   float ffn_up[restrict SEQUENCE_CHUNK_MAX_LEN][hidden_dim],
   float ffn_out[restrict SEQUENCE_CHUNK_MAX_LEN][embedding_dim],
   float logits[restrict SEQUENCE_CHUNK_MAX_LEN][vocabulary_len],
-  int pos
+  int pos,
+  int logits_count
 ) {
   // Get embedding representation of each token in the token sequence
   for (int t = 0; t < sequence_len; t++) {
@@ -676,18 +677,24 @@ float* forward(
 
   // classifier into logits
   matmul(
-      sequence_len,
+      logits_count,
       vocabulary_len,
       embedding_dim,
-      logits,
-      embedding,
+      logits + sequence_len - logits_count,
+      embedding + sequence_len - logits_count,
       out_weight
   );
 
-  return &logits[sequence_len - 1][0];
+  return &logits[sequence_len - logits_count][0];
 }
 
-float* driver(transformer_t* transformer, int sequence_len, int* sequence, int pos) {
+float* driver(
+    transformer_t* transformer,
+    int sequence_len,
+    int* sequence,
+    int pos,
+    int logits_count
+) {
   configuration_t* c = &transformer->config;
   parameter_set_t* p = &transformer->params;
   state_t* s = &transformer->state;
@@ -749,7 +756,8 @@ float* driver(transformer_t* transformer, int sequence_len, int* sequence, int p
       (float (*)[embedding_dim])s->ffn_out,
       (float (*)[vocabulary_len])s->logits,
 
-      pos
+      pos,
+      logits_count
   );
 }
 
@@ -1240,8 +1248,11 @@ void generate(
   size_t remaining_sequence_len = sequence_len;
   size_t chunk_len = MIN(remaining_sequence_len, SEQUENCE_CHUNK_MAX_LEN);
   while (chunk_len != 0) {
+    // We only compute the very last logits
+    int logits_count = (remaining_sequence_len - chunk_len == 0) ? 1 : 0;
+
     // Run the transformer to fill the KV-cache and get final logits
-    float* logits = driver(transformer, chunk_len, chunk, past);
+    float* logits = driver(transformer, chunk_len, chunk, past, logits_count);
 
     remaining_sequence_len -= chunk_len;
     chunk += chunk_len;
@@ -1267,7 +1278,7 @@ void generate(
 
     // forward the transformer to get logits for the next token
     int current = next;
-    float* logits = driver(transformer, 1, &current, past);
+    float* logits = driver(transformer, 1, &current, past, 1);
     next = sample(sampler, logits);
     generated_count++;
     past++;
