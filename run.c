@@ -1228,12 +1228,9 @@ void generate(
   }
   printf("\033[0m");
 
-  // start the main loop
-  long start = time_in_ms();
-
   int next; // will store the next token in the sequence
-  int token = sequence[0]; // kick off with the first token in the prompt
- 
+  float* warmup = driver(transformer, 1, sequence, 0, 1); // cache warmup
+
   size_t generated_count = 0; // number of tokens generated so far  
   size_t past = 0; // number of tokens already processed
 
@@ -1243,10 +1240,17 @@ void generate(
     exit(EXIT_FAILURE);
   }
 
+  // Timing
+  long start = 0;
+  long end = 0;
+  double prefill_time = 0.0;
+  double decode_time = 0.0;
+
   // First process the input token sequence by chunks
   int* chunk = sequence;
   size_t remaining_sequence_len = sequence_len;
   size_t chunk_len = MIN(remaining_sequence_len, SEQUENCE_CHUNK_MAX_LEN);
+  start = time_in_ms();
   while (chunk_len != 0) {
     // We only compute the very last logits
     int logits_count = (remaining_sequence_len - chunk_len == 0) ? 1 : 0;
@@ -1261,6 +1265,9 @@ void generate(
     
     // First token generation after the prompt has been processed
     if (chunk_len == 0) {
+      end = time_in_ms();
+      prefill_time = (end - start) / 1000.0;
+
       next = sample(sampler, logits);
       // print the token as string, decode it with the Tokenizer object
       int current = sequence[sequence_len - 1];
@@ -1272,13 +1279,16 @@ void generate(
   }
 
   // Then generate tokens one by one
-  //while (generated_count < steps) {
-  while (past < steps) {
-  //while (0) {
-
+  start = time_in_ms();
+  while (generated_count < steps) {
     // forward the transformer to get logits for the next token
     int current = next;
     float* logits = driver(transformer, 1, &current, past, 1);
+
+    end = time_in_ms();
+    decode_time += (end - start) / 1000.0;
+    start = end;
+
     next = sample(sampler, logits);
     generated_count++;
     past++;
@@ -1297,11 +1307,9 @@ void generate(
   printf("\n");
 
   // report achieved tok/s
-  if (past > 1) {
-    long end = time_in_ms();
-    fprintf(
-        stderr, "achieved tok/s: %f\n", (past - 1) / (double)(end - start) * 1000
-    );
+  if (past > 2) {
+    fprintf(stderr, "Prefill: %f tok/s\n", sequence_len / prefill_time);
+    fprintf(stderr, "Decode:  %f tok/s\n", (generated_count - 1) / decode_time);
   }
 
   free(sequence);
