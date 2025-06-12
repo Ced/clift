@@ -13,6 +13,9 @@
     #include <unistd.h>
     #include <sys/mman.h>
 #endif
+#include <sys/time.h>
+#include <sys/resource.h>
+
 // ----------------------------------------------------------------------------
 // Transformer model
 
@@ -73,6 +76,155 @@ typedef struct {
     float* data; // memory mapped data pointer
     ssize_t file_size; // size of the checkpoint file in bytes
 } Transformer;
+
+// Instrumentation
+double get_time()
+{
+    struct timeval t;
+    struct timezone tzp;
+    gettimeofday(&t, &tzp);
+    return (t.tv_sec + t.tv_usec*1e-6) * 1e4;
+}
+typedef struct {
+    int n_steps;
+    double* global_time;
+    double* rmsnorm_first_time;
+    double* matmul_qkv_time;
+    double* rope_time;
+    double* multihead_time;
+    double* matmul_output_attention_time;
+    double* FFN_rmsnorm_time;
+    double* matmul_FFN_time;
+    double* swiGLU_time;
+    double* _time;
+    double* matmul_output_FFN_time;
+    double* rmsnorm_final_time;
+    double* matmul_logits_time;
+
+} ForwardInstrumentation;
+
+typedef struct {
+    int n_steps;
+    int n_generation_steps;
+    double encode_time;
+    ForwardInstrumentation* forward_instr;
+    double* sampling;
+    double* decode_time;
+    Config config;
+
+
+} Instrumentation ;
+
+void pretty_print_config(Config config) {
+    printf("{\n");
+    printf("  \"dim\": %d,\n", config.dim);
+    printf("  \"hidden_dim\": %d,\n", config.hidden_dim);
+    printf("  \"n_layers\": %d,\n", config.n_layers);
+    printf("  \"n_heads\": %d,\n", config.n_heads);
+    printf("  \"n_kv_heads\": %d,\n", config.n_kv_heads);
+    printf("  \"vocab_size\": %d,\n", config.vocab_size);
+    printf("  \"seq_len\": %d\n", config.seq_len);
+    printf("}\n");
+}
+
+void print_double_array_json(const char* label, double* array, int size) {
+    printf("\"%s\": [", label);
+    for (int i = 0; i < size; ++i) {
+        printf("%.4f", array[i]);
+        if (i < size - 1) {
+            printf(", ");
+        }
+    }
+    printf("]");
+}
+void pretty_printer(Instrumentation instr, Config config) {
+    printf("{\n");
+
+    printf("  \"n_steps\": %d,\n", instr.n_steps);
+    printf("  \"n_generation_steps\": %d,\n", instr.n_generation_steps);
+    printf("  \"encode_time\": %.4f,\n", instr.encode_time);
+    print_double_array_json("sampling", instr.sampling, instr.n_steps);
+    printf(",\n");
+    print_double_array_json("decode_time", instr.decode_time, instr.n_steps);
+
+    printf(",\n");
+
+    if (instr.forward_instr) {
+        ForwardInstrumentation* f = instr.forward_instr;
+        printf("  \"forward_instr\": {\n");
+
+        printf("    \"n_steps\": %d,\n", f->n_steps);
+        print_double_array_json("global_time", f->global_time,f->n_steps);printf(",\n");
+
+        print_double_array_json("rmsnorm_first_time", f->rmsnorm_first_time, f->n_steps); printf(",\n");
+        print_double_array_json("matmul_qkv_time", f->matmul_qkv_time, f->n_steps); printf(",\n");
+        print_double_array_json("rope_time", f->rope_time, f->n_steps); printf(",\n");
+        print_double_array_json("multihead_time", f->multihead_time, f->n_steps); printf(",\n");
+        print_double_array_json("matmul_output_attention_time", f->matmul_output_attention_time, f->n_steps); printf(",\n");
+        print_double_array_json("FFN_rmsnorm_time", f->FFN_rmsnorm_time, f->n_steps); printf(",\n");
+        print_double_array_json("matmul_FFN_time", f->matmul_FFN_time, f->n_steps); printf(",\n");
+        print_double_array_json("swiGLU_time", f->swiGLU_time, f->n_steps); printf(",\n");
+        print_double_array_json("matmul_output_FFN_time", f->matmul_output_FFN_time, f->n_steps); printf(",\n");
+        print_double_array_json("rmsnorm_final_time", f->rmsnorm_final_time, f->n_steps); printf(",\n");
+        print_double_array_json("matmul_logits_time", f->matmul_logits_time, f->n_steps); printf("\n");
+        printf("  },\n");
+
+    }
+    printf("  \"config\":");pretty_print_config(config);
+    printf("}\n");
+}
+Instrumentation instrumentator;
+int global_instr = 0;
+void init_instrumentator(int n_steps, int n_gen_steps) {
+    instrumentator.n_steps = n_steps;
+    instrumentator.n_generation_steps = n_gen_steps;
+    instrumentator.encode_time = 0.0;
+    instrumentator.decode_time = calloc(n_steps, sizeof(double));
+    instrumentator.sampling = calloc(n_steps, sizeof(double));
+
+    instrumentator.forward_instr = calloc(1, sizeof(ForwardInstrumentation));
+    ForwardInstrumentation* fwd = instrumentator.forward_instr;
+
+    fwd->n_steps = n_steps;
+    fwd->global_time = calloc(n_steps, sizeof(double));
+
+    fwd->rmsnorm_first_time = calloc(n_steps, sizeof(double));
+    fwd->matmul_qkv_time = calloc(n_steps, sizeof(double));
+    fwd->rope_time = calloc(n_steps, sizeof(double));
+    fwd->multihead_time = calloc(n_steps, sizeof(double));
+    fwd->matmul_output_attention_time = calloc(n_steps, sizeof(double));
+    fwd->FFN_rmsnorm_time = calloc(n_steps, sizeof(double));
+    fwd->matmul_FFN_time = calloc(n_steps, sizeof(double));
+    fwd->swiGLU_time = calloc(n_steps, sizeof(double));
+    fwd->_time = calloc(n_steps, sizeof(double));
+    fwd->matmul_output_FFN_time = calloc(n_steps, sizeof(double));
+    fwd->rmsnorm_final_time = calloc(n_steps, sizeof(double));
+    fwd->matmul_logits_time = calloc(n_steps, sizeof(double));
+}
+void free_instrumentator() {
+    if (!instrumentator.forward_instr) return;
+
+    ForwardInstrumentation* fwd = instrumentator.forward_instr;
+
+    free(instrumentator.sampling);
+
+    free(fwd->rmsnorm_first_time);
+    free(fwd->matmul_qkv_time);
+    free(fwd->rope_time);
+    free(fwd->multihead_time);
+    free(fwd->matmul_output_attention_time);
+    free(fwd->FFN_rmsnorm_time);
+    free(fwd->matmul_FFN_time);
+    free(fwd->swiGLU_time);
+    free(fwd->_time);
+    free(fwd->matmul_output_FFN_time);
+    free(fwd->rmsnorm_final_time);
+    free(fwd->matmul_logits_time);
+
+    free(fwd);
+    instrumentator.forward_instr = NULL;
+}
+// ----------------------------------------------------------------------------
 
 void malloc_run_state(RunState* s, Config* p) {
     // we calloc instead of malloc to keep valgrind happy
@@ -243,13 +395,17 @@ float* forward(Transformer* transformer, int token, int pos) {
 
     // copy the token embedding into x
     float* content_row = w->token_embedding_table + token * dim;
+    double full_time = 0. ;
+    double st;
     memcpy(x, content_row, dim*sizeof(*x));
-
     // forward all the layers
+
     for(unsigned long long l = 0; l < p->n_layers; l++) {
 
         // attention rmsnorm
+        double st = get_time();
         rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
+        instrumentator.forward_instr->rmsnorm_first_time[pos] += get_time() -st;
 
         // key and value point to the kv cache
         int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
@@ -257,11 +413,15 @@ float* forward(Transformer* transformer, int token, int pos) {
         s->v = s->value_cache + loff + pos * kv_dim;
 
         // qkv matmuls for this position
+        st = get_time();
         matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
         matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
         matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+        instrumentator.forward_instr->matmul_qkv_time[pos] += get_time() -st;
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
+        st = get_time();
+
         for (int i = 0; i < dim; i+=2) {
             int head_dim = i % head_size;
             float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
@@ -277,16 +437,18 @@ float* forward(Transformer* transformer, int token, int pos) {
                 vec[i+1] = v0 * fci + v1 * fcr;
             }
         }
-
+        instrumentator.forward_instr->rope_time[pos] += get_time() -st;
         // multihead attention. iterate over all heads
         int h;
+        st = get_time();
+
         #pragma omp parallel for private(h)
         for (h = 0; h < p->n_heads; h++) {
             // get the query vector for this head
             float* q = s->q + h * head_size;
             // attention scores for this head
             float* att = s->att + h * p->seq_len;
-            // iterate over all timesteps, including the current one
+            // iterate over all timesteps, including the current one=
             for (int t = 0; t <= pos; t++) {
                 // get the key vector for this head and at this timestep
                 float* k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
@@ -317,24 +479,32 @@ float* forward(Transformer* transformer, int token, int pos) {
                 }
             }
         }
+        instrumentator.forward_instr->multihead_time[pos] += get_time() -st;
+
 
         // final matmul to get the output of the attention
-        matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+        st = get_time();
 
+        matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+        instrumentator.forward_instr-> matmul_output_attention_time[pos] += get_time() -st;
         // residual connection back into x
         for (int i = 0; i < dim; i++) {
             x[i] += s->xb2[i];
         }
 
-        // ffn rmsnorm
-        rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
 
+        // ffn rmsnorm
+        st = get_time();
+        rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+        instrumentator.forward_instr->FFN_rmsnorm_time[pos] += get_time() -st;
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
+        st = get_time();
         matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
         matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
-
+        instrumentator.forward_instr->matmul_FFN_time[pos] += get_time() -st;
         // SwiGLU non-linearity
+        st = get_time();
         for (int i = 0; i < hidden_dim; i++) {
             float val = s->hb[i];
             // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
@@ -343,10 +513,11 @@ float* forward(Transformer* transformer, int token, int pos) {
             val *= s->hb2[i];
             s->hb[i] = val;
         }
-
+        instrumentator.forward_instr->swiGLU_time[pos] += get_time() -st;
         // final matmul to get the output of the ffn
+        st = get_time();
         matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
-
+        instrumentator.forward_instr->matmul_output_FFN_time[pos] += get_time() -st;
         // residual connection
         for (int i = 0; i < dim; i++) {
             x[i] += s->xb[i];
@@ -354,10 +525,13 @@ float* forward(Transformer* transformer, int token, int pos) {
     }
 
     // final rmsnorm
+    st = get_time();
     rmsnorm(x, x, w->rms_final_weight, dim);
-
+    instrumentator.forward_instr->rmsnorm_final_time[pos] += get_time() -st;
     // classifier into logits
+    st = get_time();
     matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+    instrumentator.forward_instr->matmul_logits_time[pos] += get_time() -st;
     return s->logits;
 }
 
@@ -732,12 +906,16 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
 
     // encode the (string) prompt into tokens sequence
     int num_prompt_tokens = 0;
+
     int* prompt_tokens = (int*)malloc((strlen(prompt)+3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
+    double st = get_time();
     encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
+    instrumentator.encode_time = get_time() - st;
     if (num_prompt_tokens < 1) {
         fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
         exit(EXIT_FAILURE);
     }
+
 
     // start the main loop
     long start = 0;  // used to time our code, only initialized after first iteration
@@ -747,27 +925,33 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     while (pos < steps) {
 
         // forward the transformer to get logits for the next token
-        float* logits = forward(transformer, token, pos);
 
+        st = get_time();
+        float* logits = forward(transformer, token, pos);
+        instrumentator.forward_instr->global_time[pos] = get_time() -st;
         // advance the state machine
         if (pos < num_prompt_tokens - 1) {
             // if we are still processing the input prompt, force the next prompt token
             next = prompt_tokens[pos + 1];
         } else {
             // otherwise sample the next token from the logits
+            st = get_time();
             next = sample(sampler, logits);
+            instrumentator.sampling[pos] += get_time()-st;
+            //printf("Sample time %f\n", get_time()- st);
         }
         pos++;
 
         // data-dependent terminating condition: the BOS (=1) token delimits sequences
         if (next == 1) { break; }
-
         // print the token as string, decode it with the Tokenizer object
+        st = get_time();
         char* piece = decode(tokenizer, token, next);
-        safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
-        fflush(stdout);
+        instrumentator.decode_time[pos] = get_time() - st;
+        //printf("Decoding time %f\n", get_time()- st);
+        //safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
+        //fflush(stdout);
         token = next;
-
         // init the timer here because the first iteration can be slower
         if (start == 0) { start = time_in_ms(); }
     }
@@ -932,6 +1116,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'z') { tokenizer_path = argv[i + 1]; }
         else if (argv[i][1] == 'm') { mode = argv[i + 1]; }
         else if (argv[i][1] == 'y') { system_prompt = argv[i + 1]; }
+        else if (argv[i][1] == 'g') { global_instr = argv[i + 1]; }
         else { error_usage(); }
     }
 
@@ -940,6 +1125,8 @@ int main(int argc, char *argv[]) {
     if (temperature < 0.0) temperature = 0.0;
     if (topp < 0.0 || 1.0 < topp) topp = 0.9;
     if (steps < 0) steps = 0;
+    // init instrumentation
+    init_instrumentator(steps,0);
 
     // build the Transformer via the model .bin file
     Transformer transformer;
@@ -963,11 +1150,12 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "unknown mode: %s\n", mode);
         error_usage();
     }
-
+    pretty_printer(instrumentator,transformer.config);
     // memory and file handles cleanup
     free_sampler(&sampler);
     free_tokenizer(&tokenizer);
     free_transformer(&transformer);
+    free_instrumentator(instrumentator);
     return 0;
 }
 #endif
