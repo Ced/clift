@@ -19,3 +19,16 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+### Acknowledgments
+
+This project includes code originally developed in the following MIT-licensed
+project(s):
+
+- **llama3.c**  
+  URL: https://github.com/jameswdelancey/llama3.c
+  Copyright (c) 2024 James Delancey
+
+  Portions of code have been reused or adapted from llama3.c (notably to
+  support tiktoken tokenizer). We warmly thank James Delancey for his work.

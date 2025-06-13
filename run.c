@@ -364,7 +364,7 @@ void rope(
 ) {
   for (int i = 0; i < row_count; i++) {
     for (int j = 0; j < col_count; j += 2) {
-      float freq = 1.0f / powf(10000.0f, j / (float)col_count);
+      float freq = 1.0f / powf(500000.0f, j / (float)col_count);
       float val = (pos + i) * freq;
       float fcr = cosf(val);
       float fci = sinf(val);
@@ -500,7 +500,7 @@ float* forward(
       for (int g = 0; g < q_head_per_kv_head_count; g++) {
         /*for (int t = 0; t < sequence_len; t++) {
           for (int e = 0; e < head_dim; e += 2) {
-            float freq = 1.0f / powf(10000.0f, e / (float)head_dim);
+            float freq = 1.0f / powf(500000.0f, e / (float)head_dim);
             float val = (pos + t) * freq;
             float fcr = cosf(val);
             float fci = sinf(val);
@@ -523,7 +523,7 @@ float* forward(
     for (int h = 0; h < kv_head_count; h++) {
       /*for (int t = 0; t < sequence_len; t++) {
         for (int e = 0; e < head_dim; e += 2) {
-          float freq = 1.0f / powf(10000.0f, e / (float)head_dim);
+          float freq = 1.0f / powf(500000.0f, e / (float)head_dim);
           float val = (pos + t) * freq;
           float fcr = cosf(val);
           float fci = sinf(val);
@@ -777,7 +777,7 @@ typedef struct {
   char** vocab;
   float* vocab_scores;
   TokenIndex* sorted_vocab;
-  int vocabulary_len;
+  int vocab_size;
   unsigned int max_token_length;
   unsigned char byte_pieces[512]; // stores all single-byte strings
 } Tokenizer;
@@ -786,12 +786,12 @@ int compare_tokens(const void* a, const void* b) {
   return strcmp(((TokenIndex*)a)->str, ((TokenIndex*)b)->str);
 }
 
-void build_tokenizer(Tokenizer* t, char* tokenizer_path, int vocabulary_len) {
-  // i should have written the vocabulary_len into the tokenizer file... sigh
-  t->vocabulary_len = vocabulary_len;
+void build_tokenizer(Tokenizer* t, char* tokenizer_path, int vocab_size) {
+  // i should have written the vocab_size into the tokenizer file... sigh
+  t->vocab_size = vocab_size;
   // malloc space to hold the scores and the strings
-  t->vocab = (char**)malloc(vocabulary_len * sizeof(char*));
-  t->vocab_scores = (float*)malloc(vocabulary_len * sizeof(float));
+  t->vocab = (char**)malloc(vocab_size * sizeof(char*));
+  t->vocab_scores = (float*)malloc(vocab_size * sizeof(float));
   t->sorted_vocab = NULL; // initialized lazily
   for (int i = 0; i < 256; i++) {
     t->byte_pieces[i * 2] = (unsigned char)i;
@@ -808,7 +808,7 @@ void build_tokenizer(Tokenizer* t, char* tokenizer_path, int vocabulary_len) {
     exit(EXIT_FAILURE);
   }
   int len;
-  for (int i = 0; i < vocabulary_len; i++) {
+  for (int i = 0; i < vocab_size; i++) {
     if (fread(t->vocab_scores + i, sizeof(float), 1, file) != 1) {
       fprintf(stderr, "failed read\n");
       exit(EXIT_FAILURE);
@@ -828,7 +828,7 @@ void build_tokenizer(Tokenizer* t, char* tokenizer_path, int vocabulary_len) {
 }
 
 void free_tokenizer(Tokenizer* t) {
-  for (int i = 0; i < t->vocabulary_len; i++) {
+  for (int i = 0; i < t->vocab_size; i++) {
     free(t->vocab[i]);
   }
   free(t->vocab);
@@ -838,11 +838,7 @@ void free_tokenizer(Tokenizer* t) {
 
 char* decode(Tokenizer* t, int prev_token, int token) {
   char* piece = t->vocab[token];
-  // following BOS (1) token, sentencepiece decoder strips any leading
-  // whitespace (see PR #89)
-  if (prev_token == 1 && piece[0] == ' ') {
-    piece++;
-  }
+
   // careful, some tokens designate raw bytes, and look like e.g. '<0x01>'
   // parse this and convert and return the actual byte
   unsigned char byte_val;
@@ -871,12 +867,12 @@ void safe_printf(char* piece) {
   printf("%s", piece);
 }
 
-int str_lookup(char* str, TokenIndex* sorted_vocab, int vocabulary_len) {
+int str_lookup(char* str, TokenIndex* sorted_vocab, int vocab_size) {
   // efficiently find the perfect match for str in vocab, return its index or -1
   // if not found
   TokenIndex tok = {.str = str}; // acts as the key to search for
   TokenIndex* res = bsearch(
-      &tok, sorted_vocab, vocabulary_len, sizeof(TokenIndex), compare_tokens
+      &tok, sorted_vocab, vocab_size, sizeof(TokenIndex), compare_tokens
   );
   return res != NULL ? res->id : -1;
 }
@@ -894,15 +890,15 @@ void encode(
 
   if (t->sorted_vocab == NULL) {
     // lazily malloc and sort the vocabulary
-    t->sorted_vocab = malloc(t->vocabulary_len * sizeof(TokenIndex));
-    for (int i = 0; i < t->vocabulary_len; i++) {
+    t->sorted_vocab = malloc(t->vocab_size * sizeof(TokenIndex));
+    for (int i = 0; i < t->vocab_size; i++) {
       t->sorted_vocab[i].str = t->vocab[i];
       t->sorted_vocab[i].id = i;
     }
-    qsort(t->sorted_vocab, t->vocabulary_len, sizeof(TokenIndex), compare_tokens);
+    qsort(t->sorted_vocab, t->vocab_size, sizeof(TokenIndex), compare_tokens);
   }
 
-  // create a temporary buffer that will store merge candidates of always tmha_out_weight
+  // create a temporary buffer that will store merge candidates of always two
   // consecutive tokens *2 for concat, +1 for null terminator +2 for UTF8 (in
   // case max_token_length is 1)
   size_t str_buffer_size = (t->max_token_length * 2 + 1 + 2) * sizeof(char);
@@ -912,19 +908,15 @@ void encode(
   // start at 0 tokens
   *n_tokens = 0;
 
-  // add optional BOS (=1) token, if desired
+  // add optional BOS (=128000) token, if desired
   if (bos)
-    tokens[(*n_tokens)++] = 1;
+    tokens[(*n_tokens)++] = 128000;
 
   // add_dummy_prefix is true by default
   // so prepend a dummy prefix token to the input string, but only if text != ""
   // TODO: pretty sure this isn't correct in the general case but I don't have
   // the energy to read more of the sentencepiece code to figure out what it's
   // doing
-  if (text[0] != '\0') {
-    int dummy_prefix = str_lookup(" ", t->sorted_vocab, t->vocabulary_len);
-    tokens[(*n_tokens)++] = dummy_prefix;
-  }
 
   // Okay UTF-8 time. This will get messy. Here is the reference from Wikipedia:
   // Code point ↔ UTF-8 conversion
@@ -940,7 +932,7 @@ void encode(
     // reset buffer if the current byte is ASCII or a leading byte
     // 0xC0 is 11000000, so (*c & 0xC0) keeps the first 2 bits and zeros the
     // rest 0x80 is 10000000 in UTF-8, all continuation bytes start with "10" in
-    // first tmha_out_weight bits so in English this is: "if this byte is not a continuation
+    // first two bits so in English this is: "if this byte is not a continuation
     // byte"
     if ((*c & 0xC0) != 0x80) {
       // this byte must be either a leading byte (11...) or an ASCII char
@@ -962,7 +954,7 @@ void encode(
     }
 
     // ok c+1 is not a continuation byte, so we've read in a full codepoint
-    int id = str_lookup(str_buffer, t->sorted_vocab, t->vocabulary_len);
+    int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
 
     if (id != -1) {
       // we found this codepoint in vocab, add it as a token
@@ -978,17 +970,26 @@ void encode(
     str_len = 0; // protect against a sequence of stray UTF8 continuation bytes
   }
 
-  // merge the best consecutive pair each iteration, according the scores in
-  // vocab_scores
+  // merge the best consecutive pair or triple each iteration, according to the
+  // scores in vocab_scores
   while (1) {
     float best_score = -1e10;
     int best_id = -1;
     int best_idx = -1;
+    int best_len =
+        2; // length of the best merge sequence (2 for pair, 3 for triple)
 
+    // first, try to find the best pair to merge
     for (int i = 0; i < (*n_tokens - 1); i++) {
       // check if we can merge the pair (tokens[i], tokens[i+1])
-      snprintf(str_buffer, str_buffer_size, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i + 1]]);
-      int id = str_lookup(str_buffer, t->sorted_vocab, t->vocabulary_len);
+      snprintf(
+          str_buffer,
+          str_buffer_size,
+          "%s%s",
+          t->vocab[tokens[i]],
+          t->vocab[tokens[i + 1]]
+      );
+      int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
       if (id != -1 && t->vocab_scores[id] > best_score) {
         // this merge pair exists in vocab! record its score and position
         best_score = t->vocab_scores[id];
@@ -997,22 +998,51 @@ void encode(
       }
     }
 
+    // if no pair was found, try to find the best triple to merge
     if (best_idx == -1) {
-      break; // we couldn't find any more pairs to merge, so we're done
+      for (int i = 0; i < (*n_tokens - 2); i++) {
+        // check if we can merge the triple (tokens[i], tokens[i+1],
+        // tokens[i+2])
+        snprintf(
+            str_buffer,
+            str_buffer_size,
+            "%s%s%s",
+            t->vocab[tokens[i]],
+            t->vocab[tokens[i + 1]],
+            t->vocab[tokens[i + 2]]
+        );
+        int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
+        if (id != -1 && t->vocab_scores[id] > best_score) {
+          // this merge triple exists in vocab! record its score and position
+          best_score = t->vocab_scores[id];
+          best_id = id;
+          best_idx = i;
+          best_len = 3;
+        }
+      }
     }
 
-    // merge the consecutive pair (best_idx, best_idx+1) into new token best_id
-    tokens[best_idx] = best_id;
-    // delete token at position best_idx+1, shift the entire sequence back 1
-    for (int i = best_idx + 1; i < (*n_tokens - 1); i++) {
-      tokens[i] = tokens[i + 1];
+    if (best_idx == -1) {
+      break; // we couldn't find any more pairs or triples to merge, so we're
+             // done
     }
-    (*n_tokens)--; // token length decreased
+
+    // merge the consecutive pair or triple (best_idx, best_idx+1[, best_idx+2])
+    // into new token best_id
+    tokens[best_idx] = best_id;
+    // delete token(s) at position best_idx+1 (and optionally best_idx+2), shift
+    // the entire sequence back
+    for (int i = best_idx + 1; i < (*n_tokens - best_len + 1); i++) {
+      tokens[i] = tokens[i + best_len - 1];
+    }
+    (*n_tokens) -=
+        (best_len - 1
+        ); // token length decreased by the number of merged tokens minus one
   }
 
-  // add optional EOS (=2) token, if desired
+  // add optional EOS (=128001) token, if desired
   if (eos)
-    tokens[(*n_tokens)++] = 2;
+    tokens[(*n_tokens)++] = 128001;
 
   free(str_buffer);
 }
