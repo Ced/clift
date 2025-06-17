@@ -1284,7 +1284,7 @@ void generate(
   int next; // Will store the next token in the sequence
 
   // Cache warmup
-  float* warmup = transformer_driver(transformer, 1, sequence, 0, 1);
+  transformer_driver(transformer, 1, sequence, 0, 1);
 
   size_t generated_count = 0; // Number of tokens generated so far
   size_t past = 0;            // Number of tokens already processed

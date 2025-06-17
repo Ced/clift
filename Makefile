@@ -1,38 +1,38 @@
 # choose your compiler, e.g. gcc/clang
-# example override to clang: make run CC=clang
+# example override to clang: make clift CC=clang
 CC = gcc
 
 # the most basic way of building that is most likely to work on most systems
-.PHONY: run
-run: run.c
-	$(CC) -O3 -ffast-math -fno-omit-frame-pointer -o run run.c -lm
+.PHONY: clift
+clift: clift.c
+	$(CC) -O3 -ffast-math -fno-omit-frame-pointer -Wall -o clift clift.c -lm
 
 # Useful to debug memory issues, e.g. with Clang's address sanitizer.
 .PHONY: asan
-asan: run.c
-	$(CC) -fsanitize=address -g -O1 -o run run.c -lm
+asan: clift.c
+	$(CC) -fsanitize=address -g -O1 -o clift clift.c -lm
 
 # useful for a debug build, can then e.g. analyze with valgrind, example:
-# $ valgrind --leak-check=full ./run out/model.bin -n 3
-rundebug: run.c
-	$(CC) -g -o run run.c -lm
+# $ valgrind --leak-check=full ./clift out/model.bin -n 3
+debug: clift.c
+	$(CC) -g -o clift clift.c -lm
 
-# additionally compiles with OpenMP, allowing multithreaded runs
-# make sure to also enable multiple threads when running, e.g.:
-# OMP_NUM_THREADS=4 ./run out/model.bin
-.PHONY: runomp
-runomp: run.c
-	$(CC) -Ofast -fopenmp -march=native run.c  -lm  -o run
+# additionally compiles with OpenMP, allowing multithreaded clifts
+# make sure to also enable multiple threads when cliftning, e.g.:
+# OMP_NUM_THREADS=4 ./clift out/model.bin
+.PHONY: cliftomp
+omp: clift.c
+	$(CC) -Ofast -fopenmp -march=native clift.c  -lm  -o clift
 
 # compiles with gnu99 standard flags for amazon linux, coreos, etc. compatibility
-.PHONY: rungnu
-rungnu:
-	$(CC) -Ofast -std=gnu11 -o run run.c -lm
+.PHONY: cliftgnu
+gnu:
+	$(CC) -Ofast -std=gnu11 -o clift clift.c -lm
 
-.PHONY: runompgnu
-runompgnu:
-	$(CC) -Ofast -fopenmp -std=gnu11 run.c  -lm  -o run
+.PHONY: cliftompgnu
+ompgnu:
+	$(CC) -Ofast -fopenmp -std=gnu11 clift.c  -lm  -o clift
 
 .PHONY: clean
 clean:
-	rm -f run
+	rm -f clift
