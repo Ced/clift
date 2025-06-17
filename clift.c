@@ -405,7 +405,6 @@ void rope(
 }
 
 float* transformer_forward(
-    transformer_t* transformer,
     int sequence_len,
     int* sequence,
     int vocabulary_len,
@@ -736,7 +735,6 @@ float* transformer_driver(
   int hidden_dim = c->hidden_dim;
 
   return transformer_forward(
-      transformer,
       sequence_len,
       sequence,
       vocabulary_len,
