@@ -3,3 +3,6 @@
 *.png
 run
 runq
+run_b
+runinstr
+__pycache__
