@@ -162,7 +162,10 @@ static void print_json_3_content(const char* json_name, char** tab_str) {
 }
 
 void print_json(char* string_values_1_add[],char* string_values_1[],char* string_values_2[],char* string_values_3[]) {
+  /* const char* commit_hash = getenv("GIT_COMMIT_HASH");
+  if (!commit_hash) commit_hash = "unknown";
   printf("{\n");
+  printf("  \"commit\": \"%s\",\n", commit_hash); */
   print_json_1_content(
       "JSON_1_COMPT", string_values_1, tab_compt_values, size_tab_compt_values
   );

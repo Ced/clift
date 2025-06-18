@@ -184,24 +184,26 @@ typedef struct {
 
 typedef struct {
   // Activations
-  float* embedding; // [chunk_len][embedding_dim]
-  float* mha_norm;  // [chunk_len][embedding_dim]
-  float* mha_q;     // [kv_head_count][q_head_per_kv_head_count][
-                    //  chunk_len][head_dim]
-  float* mha_score; // [kv_head_count][q_head_per_kv_head_count][
-                    //  context_len][context_len]
-  float* mha_blend; // [kv_head_count][q_head_per_kv_head_count][
-                    //  chunk_len][head_dim]
-  float* mha_att;   // [chunk_len][embedding_dim]
-  float* mha_out;   // [chunk_len][embedding_dim]
-  float* ffn_norm;  // [chunk_len][embedding_dim]
-  float* ffn_fc;    // [chunk_len][hidden_dim]
-  float* ffn_up;    // [chunk_len][hidden_dim]
-  float* ffn_out;   // [chunk_len][embedding_dim]
-  float* logits;    // [chunk_len][vocabulary_len]
+  float* embedding;    // [chunk_len][embedding_dim]
+  float* mha_norm;     // [chunk_len][embedding_dim]
+  float* mha_q;        // [kv_head_count][q_head_per_kv_head_count][
+                       //  chunk_len][head_dim]
+  float* mha_score;    // [kv_head_count][q_head_per_kv_head_count][
+                       //  context_len][context_len]
+  float* mha_blend;    // [kv_head_count][q_head_per_kv_head_count][
+                       //  chunk_len][head_dim]
+  float* mha_att;      // [chunk_len][embedding_dim]
+  float* mha_out;      // [chunk_len][embedding_dim]
+  float* ffn_norm;     // [chunk_len][embedding_dim]
+  float* ffn_fc;       // [chunk_len][hidden_dim]
+  float* ffn_up;       // [chunk_len][hidden_dim]
+  float* ffn_out;      // [chunk_len][embedding_dim]
+  float* logits;       // [chunk_len][vocabulary_len]
   // KV-cache
-  float* k_cache; // [layer_count][kv_head_count][context_len][head_dim]
-  float* v_cache; // [layer_count][kv_head_count][context_len][head_dim]
+  float* k_cache;      // [layer_count][kv_head_count][context_len][head_dim]
+  float* v_cache;      // [layer_count][kv_head_count][context_len][head_dim]
+  // Utility variables
+  float* rope_cos_sin; // [context_len][head_dim]
 } state_t;
 
 typedef struct {
@@ -214,12 +216,14 @@ typedef struct {
 } transformer_t;
 
 void state_malloc(state_t* s, configuration_t* p) {
-  size_t kv_dim = (p->embedding_dim * p->kv_head_count) / p->q_head_count;
+  size_t head_dim = p->embedding_dim / p->q_head_count;
+  size_t kv_dim = head_dim * p->kv_head_count;
   size_t embedding_len = SEQUENCE_CHUNK_MAX_LEN * p->embedding_dim;
   size_t hidden_len = SEQUENCE_CHUNK_MAX_LEN * p->hidden_dim;
   size_t score_len = p->q_head_count * p->context_len * p->context_len;
   size_t cache_len = p->context_len * p->layer_count * kv_dim;
   size_t logits_len = SEQUENCE_CHUNK_MAX_LEN * p->vocabulary_len;
+  size_t rope_len = p->context_len * head_dim;
 
   s->embedding = calloc(embedding_len, sizeof(*s->embedding));
   s->mha_norm = calloc(embedding_len, sizeof(*s->mha_norm));
@@ -235,14 +239,36 @@ void state_malloc(state_t* s, configuration_t* p) {
   s->logits = calloc(logits_len, sizeof(float));
   s->k_cache = calloc(cache_len, sizeof(*s->k_cache));
   s->v_cache = calloc(cache_len, sizeof(*s->v_cache));
+  s->rope_cos_sin = calloc(rope_len, sizeof(*s->rope_cos_sin));
 
   // Ensure all mallocs went fine
-  if (!s->embedding || !s->mha_norm || !s->mha_q || !s->mha_score ||
-      !s->mha_blend || !s->mha_att || !s->mha_out || !s->ffn_norm ||
-      !s->ffn_fc || !s->ffn_up || !s->ffn_out || !s->logits || !s->k_cache ||
-      !s->v_cache) {
+  if (!s->embedding ||
+      !s->mha_norm ||
+      !s->mha_q ||
+      !s->mha_score ||
+      !s->mha_blend ||
+      !s->mha_att ||
+      !s->mha_out ||
+      !s->ffn_norm ||
+      !s->ffn_fc ||
+      !s->ffn_up ||
+      !s->ffn_out ||
+      !s->logits ||
+      !s->k_cache ||
+      !s->v_cache ||
+      !s->rope_cos_sin) {
     fprintf(stderr, "malloc failed!\n");
     exit(EXIT_FAILURE);
+  }
+
+  // Initialize RoPE cosine and sine values
+  for (size_t i = 0; i < p->context_len; i++) {
+    for (size_t j = 0; j < head_dim; j += 2) {
+      float freq = 1.0f / powf(500000.0f, j / (float)head_dim);
+      float val = i * freq;
+      s->rope_cos_sin[i * head_dim + j] = cosf(val);
+      s->rope_cos_sin[i * head_dim + j + 1] = sinf(val);
+    }
   }
 }
 
@@ -261,6 +287,7 @@ void state_free(state_t* s) {
   free(s->logits);
   free(s->k_cache);
   free(s->v_cache);
+  free(s->rope_cos_sin);
 }
 
 void parameter_set_mmap(
@@ -361,48 +388,51 @@ void transformer_free(transformer_t* t) {
 // Neural net blocks; the dynamics of the transformer_t
 
 void rmsnorm(
-    int row_count,
-    int col_count,
-    float y[row_count][col_count],
-    float x[row_count][col_count],
-    float w[col_count],
+    int sequence_len,
+    int embedding_dim,
+    float y[sequence_len][embedding_dim],
+    float x[sequence_len][embedding_dim],
+    float w[embedding_dim],
     float epsilon
 ) {
-  for (int i = 0; i < row_count; i++) {
+  for (int i = 0; i < sequence_len; i++) {
     // Calculate sum of squares
     float ss = 0.0f;
-    for (int j = 0; j < col_count; j++) {
+    for (int j = 0; j < embedding_dim; j++) {
       ss += x[i][j] * x[i][j];
     }
-    ss /= col_count;
+    ss /= embedding_dim;
     ss += epsilon;
     ss = 1.0f / sqrtf(ss);
     // Normalize and scale
-    for (int j = 0; j < col_count; j++) {
+    for (int j = 0; j < embedding_dim; j++) {
       y[i][j] = w[j] * (ss * x[i][j]);
     }
   }
 }
 
 void softmax(
-    int row_count, int col_count, int col_stride, float x[row_count][col_stride]
+    int sequence_len,
+    int past,
+    int context_len,
+    float x[sequence_len][context_len]
 ) {
-  for (int i = 0; i < row_count; i++) {
+  for (int i = 0; i < sequence_len; i++) {
     // Find max value (for numerical stability)
     float max_val = x[i][0];
-    for (int j = 1; j < i + col_count; j++) {
+    for (int j = 1; j < past + i + 1; j++) {
       if (x[i][j] > max_val) {
         max_val = x[i][j];
       }
     }
     // Exp and sum
     float sum = 0.0f;
-    for (int j = 0; j < i + col_count; j++) {
+    for (int j = 0; j < past + i + 1; j++) {
       x[i][j] = expf(x[i][j] - max_val);
       sum += x[i][j];
     }
     // Normalize
-    for (int j = 0; j < i + col_count; j++) {
+    for (int j = 0; j < past + i + 1; j++) {
       x[i][j] /= sum;
     }
   }
@@ -427,14 +457,17 @@ void matmul(
 }
 
 void rope(
-    int row_count, int col_count, float x[row_count][col_count], int pos
+    int context_len,
+    int sequence_len,
+    int head_dim,
+    float x[sequence_len][head_dim],
+    float rope_cos_sin[context_len][head_dim],
+    int pos
 ) {
-  for (int i = 0; i < row_count; i++) {
-    for (int j = 0; j < col_count; j += 2) {
-      float freq = 1.0f / powf(500000.0f, j / (float)col_count);
-      float val = (pos + i) * freq;
-      float fcr = cosf(val);
-      float fci = sinf(val);
+  for (int i = 0; i < sequence_len; i++) {
+    for (int j = 0; j < head_dim; j += 2) {
+      float fcr = rope_cos_sin[pos + i][j];
+      float fci = rope_cos_sin[pos + i][j + 1];
       float v0 = x[i][j];
       float v1 = x[i][j + 1];
       x[i][j] = v0 * fcr - v1 * fci;
@@ -482,6 +515,7 @@ float* transformer_forward(
                [SEQUENCE_CHUNK_MAX_LEN][head_dim],
     float k_cache[restrict layer_count][kv_head_count][context_len][head_dim],
     float v_cache[restrict layer_count][kv_head_count][context_len][head_dim],
+    float rope_cos_sin[restrict context_len][head_dim],
     float mha_score[restrict kv_head_count][q_head_per_kv_head_count]
                    [context_len][context_len],
     float mha_blend[restrict kv_head_count][q_head_per_kv_head_count]
@@ -543,17 +577,6 @@ float* transformer_forward(
       );
     }
 
-    /*if (l < 2) {
-      for (int h = 0; h < kv_head_count; h++) {
-        for (int t = 0; t < sequence_len; t++) {
-          for (int e = 0; e < head_dim; e++) {
-            mha_att[t][h * head_dim + e] = k_cache[l][h][pos + t][e];
-          }
-        }
-      }
-      vector_print(kv_dim, (float*)mha_att[0], 3, "k");
-    }*/
-
     for (int h = 0; h < kv_head_count; h++) {
       matmul(
           sequence_len,
@@ -569,37 +592,27 @@ float* transformer_forward(
     // RoPE q: complex-valued rotate q in each head
     for (int h = 0; h < kv_head_count; h++) {
       for (int g = 0; g < q_head_per_kv_head_count; g++) {
-        /*for (int t = 0; t < sequence_len; t++) {
-          for (int e = 0; e < head_dim; e += 2) {
-            float freq = 1.0f / powf(500000.0f, e / (float)head_dim);
-            float val = (pos + t) * freq;
-            float fcr = cosf(val);
-            float fci = sinf(val);
-            float v0 = mha_q[h][g][t][e];
-            float v1 = mha_q[h][g][t][e + 1];
-            mha_q[h][g][t][e] = v0 * fcr - v1 * fci;
-            mha_q[h][g][t][e + 1] = v0 * fci + v1 * fcr;
-          }
-        }*/
-        rope(sequence_len, head_dim, mha_q[h][g], past);
+        rope(
+          context_len,
+          sequence_len,
+          head_dim,
+          mha_q[h][g],
+          rope_cos_sin,
+          past
+        );
       }
     }
 
     // RoPE k: complex-valued rotate k in each head
     for (int h = 0; h < kv_head_count; h++) {
-      /*for (int t = 0; t < sequence_len; t++) {
-        for (int e = 0; e < head_dim; e += 2) {
-          float freq = 1.0f / powf(500000.0f, e / (float)head_dim);
-          float val = (pos + t) * freq;
-          float fcr = cosf(val);
-          float fci = sinf(val);
-          float v0 = k_cache[l][h][pos + t][e];
-          float v1 = k_cache[l][h][pos + t][e + 1];
-          k_cache[l][h][pos + t][e] = v0 * fcr - v1 * fci;
-          k_cache[l][h][pos + t][e + 1] = v0 * fci + v1 * fcr;
-        }
-      }*/
-      rope(sequence_len, head_dim, k_cache[l][h] + past, past);
+      rope(
+          context_len,
+          sequence_len,
+          head_dim,
+          k_cache[l][h] + past,
+          rope_cos_sin,
+          past
+      );
     }
     STOP_2(st, ROPE, past);
     START(st);
@@ -619,7 +632,7 @@ float* transformer_forward(
         }
 
         // Softmax the scores to get attention weights
-        softmax(sequence_len, past + 1, context_len, mha_score[h][g]);
+        softmax(sequence_len, past, context_len, mha_score[h][g]);
 
         for (int t = 0; t < sequence_len; t++) {
           // Weighted sum of the values
@@ -816,11 +829,9 @@ float* transformer_driver(
       )s->mha_q,
       (float (*)[kv_head_count][context_len][head_dim])s->k_cache,
       (float (*)[kv_head_count][context_len][head_dim])s->v_cache,
-      (float (*)[q_head_per_kv_head_count][context_len][context_len]
-      )s->mha_score,
-      (float (*
-      )[q_head_per_kv_head_count][SEQUENCE_CHUNK_MAX_LEN][embedding_dim]
-      )s->mha_blend,
+      (float (*)[head_dim])s->rope_cos_sin,
+      (float (*)[q_head_per_kv_head_count][context_len][context_len])s->mha_score,
+      (float (*)[q_head_per_kv_head_count][SEQUENCE_CHUNK_MAX_LEN][embedding_dim])s->mha_blend,
       (float (*)[embedding_dim])s->mha_att,
       (float (*)[embedding_dim])s->mha_out,
       (float (*)[embedding_dim])s->ffn_norm,
@@ -1389,7 +1400,6 @@ void generate(
   }
 
   // Then generate tokens one by one
-  start = time_in_ms();
   while (generated_count < steps) {
     // Forward the transformer to get logits for the next token
     int current = next;
