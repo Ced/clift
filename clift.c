@@ -1,20 +1,72 @@
 /* Inference for LLaMa 3.x transformer_t model in pure C */
 
-#include <float.h>
+#include "instrumentor.h"
 #include <ctype.h>
 #include <fcntl.h>
+#include <float.h>
 #include <math.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stddef.h>
 #include <string.h>
-#include <time.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
-
 // ----------------------------------------------------------------------------
 // Utilities
+typedef enum {
+  PROMPT_LEN = 0,
+  TOKEN_GENERATED = 1,
+  N_InstrAdd1ID_VALUES = 2
+} InstrAdd1ID;
+char* string_values_1_add[] = {"PROMPT_LEN", "TOKEN_GENERATED"};
+typedef enum {
+  ENCODE_TIME = 0,
+  FORWARD_TIME_GENERATION = 1,
+  FORWARD_TIME_PROMPT = 2,
+  SAMPLE_TIME = 3,
+  N_InstrStop1ID_VALUES
+} InstrStop1ID;
 
+char* string_values_1[] = {
+    "ENCODE_TIME",
+    "FORWARD_TIME_GENERATION",
+    "FORWARD_TIME_PROMPT",
+    "SAMPLE_TIME"
+};
+
+typedef enum {
+  FFN_RMSNORM = 0,
+  FINAL_RMSNORM = 1,
+  MAMTUL_LOGITS = 2,
+  MATMUL_FFN = 3,
+  MATMUL_OUTPUT_ATTENTION = 4,
+  MATMUL_OUTPUT_FFN = 5,
+  MATMUL_QKV = 6,
+  ATTENTION_COMPUTATION = 7,
+  RMSNORM_INIT = 8,
+  ROPE = 9,
+  SwiGLU = 10,
+  N_InstrStop2ID_VALUES
+} InstrStop2ID;
+
+char* string_values_2[] = {
+    "FFN_RMSNORM",
+    "FINAL_RMSNORM",
+    "MAMTUL_LOGITS",
+    "MATMUL_FFN",
+    "MATMUL_OUTPUT_ATTENTION",
+    "MATMUL_OUTPUT_FFN",
+    "MATMUL_QKV",
+    "MHA",
+    "RMSNORM_INIT",
+    "ROPE",
+    "SwiGLU",
+};
+
+typedef enum { N_InstrStop3ID_VALUES } InstrStop3ID;
+char* string_values_3[] = {
+};
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
@@ -148,8 +200,8 @@ typedef struct {
   float* ffn_out;   // [chunk_len][embedding_dim]
   float* logits;    // [chunk_len][vocabulary_len]
   // KV-cache
-  float* k_cache;   // [layer_count][kv_head_count][context_len][head_dim]
-  float* v_cache;   // [layer_count][kv_head_count][context_len][head_dim]
+  float* k_cache; // [layer_count][kv_head_count][context_len][head_dim]
+  float* v_cache; // [layer_count][kv_head_count][context_len][head_dim]
 } state_t;
 
 typedef struct {
@@ -185,19 +237,9 @@ void state_malloc(state_t* s, configuration_t* p) {
   s->v_cache = calloc(cache_len, sizeof(*s->v_cache));
 
   // Ensure all mallocs went fine
-  if (!s->embedding ||
-      !s->mha_norm ||
-      !s->mha_q ||
-      !s->mha_score ||
-      !s->mha_blend ||
-      !s->mha_att ||
-      !s->mha_out ||
-      !s->ffn_norm ||
-      !s->ffn_fc ||
-      !s->ffn_up ||
-      !s->ffn_out ||
-      !s->logits ||
-      !s->k_cache ||
+  if (!s->embedding || !s->mha_norm || !s->mha_q || !s->mha_score ||
+      !s->mha_blend || !s->mha_att || !s->mha_out || !s->ffn_norm ||
+      !s->ffn_fc || !s->ffn_up || !s->ffn_out || !s->logits || !s->k_cache ||
       !s->v_cache) {
     fprintf(stderr, "malloc failed!\n");
     exit(EXIT_FAILURE);
@@ -385,10 +427,7 @@ void matmul(
 }
 
 void rope(
-    int row_count,
-    int col_count,
-    float x[row_count][col_count],
-    int pos
+    int row_count, int col_count, float x[row_count][col_count], int pos
 ) {
   for (int i = 0; i < row_count; i++) {
     for (int j = 0; j < col_count; j += 2) {
@@ -463,11 +502,12 @@ float* transformer_forward(
       embedding[t][e] = embedding_weight[sequence[t]][e];
     }
   }
-
+  double st = 0;
   // Forward all the layers
   for (int l = 0; l < layer_count; l++) {
 
     // Attention rmsnorm
+    START(st);
     rmsnorm(
         sequence_len,
         embedding_dim,
@@ -476,8 +516,9 @@ float* transformer_forward(
         mha_norm_weight[l],
         epsilon
     );
-
+    STOP_2(st, RMSNORM_INIT, past);
     // QKV matmuls for this position
+    START(st);
     for (int h = 0; h < kv_head_count; h++) {
       for (int g = 0; g < q_head_per_kv_head_count; g++) {
         matmul(
@@ -501,7 +542,7 @@ float* transformer_forward(
           mha_k_weight[l][h]
       );
     }
-    
+
     /*if (l < 2) {
       for (int h = 0; h < kv_head_count; h++) {
         for (int t = 0; t < sequence_len; t++) {
@@ -512,7 +553,7 @@ float* transformer_forward(
       }
       vector_print(kv_dim, (float*)mha_att[0], 3, "k");
     }*/
-  
+
     for (int h = 0; h < kv_head_count; h++) {
       matmul(
           sequence_len,
@@ -523,7 +564,8 @@ float* transformer_forward(
           mha_v_weight[l][h]
       );
     }
-
+    STOP_2(st, MATMUL_QKV, past);
+    START(st);
     // RoPE q: complex-valued rotate q in each head
     for (int h = 0; h < kv_head_count; h++) {
       for (int g = 0; g < q_head_per_kv_head_count; g++) {
@@ -539,12 +581,7 @@ float* transformer_forward(
             mha_q[h][g][t][e + 1] = v0 * fci + v1 * fcr;
           }
         }*/
-        rope(
-          sequence_len,
-          head_dim,
-          mha_q[h][g],
-          past
-        );
+        rope(sequence_len, head_dim, mha_q[h][g], past);
       }
     }
 
@@ -562,14 +599,10 @@ float* transformer_forward(
           k_cache[l][h][pos + t][e + 1] = v0 * fci + v1 * fcr;
         }
       }*/
-      rope(
-          sequence_len,
-          head_dim,
-          k_cache[l][h] + past,
-          past
-      );
+      rope(sequence_len, head_dim, k_cache[l][h] + past, past);
     }
-
+    STOP_2(st, ROPE, past);
+    START(st);
     // Multihead attention. iterate over all heads
     for (int h = 0; h < kv_head_count; h++) {
       for (int g = 0; g < q_head_per_kv_head_count; g++) {
@@ -613,6 +646,8 @@ float* transformer_forward(
         }
       }
     }
+    STOP_2(st, ATTENTION_COMPUTATION, past);
+    START(st);
 
     // Final matmul to get the output of the attention
     matmul(
@@ -623,6 +658,7 @@ float* transformer_forward(
         mha_att,
         mha_out_weight[l]
     );
+    STOP_2(st, MATMUL_OUTPUT_ATTENTION, past);
 
     // Residual connection back into x
     for (int t = 0; t < sequence_len; t++) {
@@ -631,6 +667,7 @@ float* transformer_forward(
       }
     }
 
+    START(st);
     // FFN rmsnorm
     rmsnorm(
         sequence_len,
@@ -640,7 +677,8 @@ float* transformer_forward(
         ffn_norm_weight[l],
         epsilon
     );
-
+    STOP_2(st, FFN_RMSNORM, past);
+    START(st);
     // Now for FFN in PyTorch we have:
     // ffn_out_weight(F.silu(ffn_fc_weight(x)) * ffn_up_weight(x))
     // First calculate ffn_fc_weight(x) and ffn_up_weight(x)
@@ -660,7 +698,8 @@ float* transformer_forward(
         ffn_norm,
         ffn_up_weight[l]
     );
-
+    STOP_2(st, MATMUL_FFN, past);
+    START(st);
     // SwiGLU non-linearity
     for (int t = 0; t < sequence_len; t++) {
       for (int e = 0; e < hidden_dim; e++) {
@@ -670,7 +709,8 @@ float* transformer_forward(
         ffn_fc[t][e] *= ffn_up[t][e];
       }
     }
-
+    STOP_2(st, SwiGLU, past);
+    START(st);
     // Final matmul to get the output of the ffn
     matmul(
         sequence_len,
@@ -680,6 +720,7 @@ float* transformer_forward(
         ffn_fc,
         ffn_out_weight[l]
     );
+    STOP_2(st, MATMUL_OUTPUT_FFN, past);
 
     // Residual connection
     for (int t = 0; t < sequence_len; t++) {
@@ -690,6 +731,7 @@ float* transformer_forward(
   }
 
   // Final rmsnorm
+  START(st);
   rmsnorm(
       sequence_len,
       embedding_dim,
@@ -698,7 +740,9 @@ float* transformer_forward(
       out_norm_weight,
       epsilon
   );
+  STOP_2(st, FINAL_RMSNORM, past);
 
+  START(st);
   // Classifier into logits
   matmul(
       logits_count,
@@ -708,7 +752,7 @@ float* transformer_forward(
       embedding + sequence_len - logits_count,
       out_weight
   );
-
+  STOP_2(st, MAMTUL_LOGITS, past);
   return &logits[sequence_len - logits_count][0];
 }
 
@@ -753,7 +797,9 @@ float* transformer_driver(
 
       (float (*)[embedding_dim])p->embedding_weight,
       (float (*)[embedding_dim])p->mha_norm_weight,
-      (float (*)[kv_head_count][q_head_per_kv_head_count][head_dim][embedding_dim])p->mha_q_weight,
+      (float (*
+      )[kv_head_count][q_head_per_kv_head_count][head_dim][embedding_dim]
+      )p->mha_q_weight,
       (float (*)[kv_head_count][head_dim][embedding_dim])p->mha_k_weight,
       (float (*)[kv_head_count][head_dim][embedding_dim])p->mha_v_weight,
       (float (*)[embedding_dim][embedding_dim])p->mha_out_weight,
@@ -761,16 +807,20 @@ float* transformer_driver(
       (float (*)[embedding_dim][hidden_dim])p->ffn_fc_weight,
       (float (*)[embedding_dim][hidden_dim])p->ffn_up_weight,
       (float (*)[hidden_dim][embedding_dim])p->ffn_out_weight,
-      (float (*))p->out_norm_weight,
+      (float(*))p->out_norm_weight,
       (float (*)[embedding_dim])p->out_weight,
 
       (float (*)[embedding_dim])s->embedding,
       (float (*)[embedding_dim])s->mha_norm,
-      (float (*)[q_head_per_kv_head_count][SEQUENCE_CHUNK_MAX_LEN][head_dim])s->mha_q,
+      (float (*)[q_head_per_kv_head_count][SEQUENCE_CHUNK_MAX_LEN][head_dim]
+      )s->mha_q,
       (float (*)[kv_head_count][context_len][head_dim])s->k_cache,
       (float (*)[kv_head_count][context_len][head_dim])s->v_cache,
-      (float (*)[q_head_per_kv_head_count][context_len][context_len])s->mha_score,
-      (float (*)[q_head_per_kv_head_count][SEQUENCE_CHUNK_MAX_LEN][embedding_dim])s->mha_blend,
+      (float (*)[q_head_per_kv_head_count][context_len][context_len]
+      )s->mha_score,
+      (float (*
+      )[q_head_per_kv_head_count][SEQUENCE_CHUNK_MAX_LEN][embedding_dim]
+      )s->mha_blend,
       (float (*)[embedding_dim])s->mha_att,
       (float (*)[embedding_dim])s->mha_out,
       (float (*)[embedding_dim])s->ffn_norm,
@@ -787,9 +837,9 @@ float* transformer_driver(
 // ----------------------------------------------------------------------------
 // The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
 
-#define MAX_TOKEN_STRING 512 // Must be multiple of 2
-#define TOKEN_BOS 128000 // Beginning of sequence token
-#define TOKEN_EOS 128001 // End of sequence token
+#define MAX_TOKEN_STRING 512    // Must be multiple of 2
+#define TOKEN_BOS        128000 // Beginning of sequence token
+#define TOKEN_EOS        128001 // End of sequence token
 
 typedef struct {
   char* str;
@@ -1253,36 +1303,39 @@ void generate(
   if (prompt == NULL) {
     prompt = empty_prompt;
   }
-
+  double st;
   // Encode the (string) prompt into tokens sequence
   int sequence_len = 0;
   // Allocate +3 for '\0', ?BOS, ?EOS
   int* sequence = malloc((strlen(prompt) + 3) * sizeof(*sequence));
+  START(st);
   tokenizer_encode(tokenizer, prompt, 1, 0, sequence, &sequence_len);
+  STOP_1(st, ENCODE_TIME);
   if (sequence_len < 1) {
     fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
     exit(EXIT_FAILURE);
   }
 
   // Print the prompt tokens
-  fprintf(stderr, "Sequence (%d tokens):\n", sequence_len);
-  for (int i = 0; i < sequence_len; i++) {
-    fprintf(stderr, "%d ", sequence[i]);
-  }
-  fprintf(stderr, "\n");
+  /*  fprintf(stderr, "Sequence (%d tokens):\n", sequence_len);
+   for (int i = 0; i < sequence_len; i++) {
+     fprintf(stderr, "%d ", sequence[i]);
+   }
+   fprintf(stderr, "\n");
 
-  // Print the prompt string
-  fprintf(stderr, "\033[1;34m");
-  while (*prompt) {
-    fprintf(stderr, "%c", *prompt);
-    prompt++;
-  }
-  fprintf(stderr, "\033[0m");
+   // Print the prompt string
+   fprintf(stderr, "\033[1;34m");
+   while (*prompt) {
+     fprintf(stderr, "%c", *prompt);
+     prompt++;
+   }
+   fprintf(stderr, "\033[0m"); */
 
   int next; // Will store the next token in the sequence
 
   // Cache warmup
-  transformer_driver(transformer, 1, sequence, 0, 1);
+
+  transformer_driver(transformer, 1, sequence, 1, 1);
 
   size_t generated_count = 0; // Number of tokens generated so far
   size_t past = 0;            // Number of tokens already processed
@@ -1303,15 +1356,17 @@ void generate(
   int* chunk = sequence;
   size_t remaining_sequence_len = sequence_len;
   size_t chunk_len = MIN(remaining_sequence_len, SEQUENCE_CHUNK_MAX_LEN);
+  ADD_1(sequence_len, PROMPT_LEN);
   start = time_in_ms();
   while (chunk_len != 0) {
     // We only compute the very last logits
     int logits_count = (remaining_sequence_len - chunk_len == 0) ? 1 : 0;
 
     // Run the transformer to fill the KV-cache and get final logits
+    START(st);
     float* logits =
         transformer_driver(transformer, chunk_len, chunk, past, logits_count);
-
+    STOP_1(st, FORWARD_TIME_PROMPT);
     remaining_sequence_len -= chunk_len;
     chunk += chunk_len;
     past += chunk_len;
@@ -1321,13 +1376,14 @@ void generate(
     if (chunk_len == 0) {
       end = time_in_ms();
       prefill_time = (end - start) / 1000.0;
-
+      START(st);
       next = sampler_sample(sampler, logits);
+      STOP_1(st, SAMPLE_TIME);
       // print the token as string, decode it with the tokenizer_t object
       int current = sequence[sequence_len - 1];
-      char* piece = tokenizer_decode(tokenizer, current, next);
+      /* char* piece = tokenizer_decode(tokenizer, current, next);
       safe_printf(piece); // Safe printf("%s", piece)
-      fflush(stdout);
+      fflush(stdout); */
       generated_count++;
     }
   }
@@ -1337,13 +1393,15 @@ void generate(
   while (generated_count < steps) {
     // Forward the transformer to get logits for the next token
     int current = next;
+    START(st);
     float* logits = transformer_driver(transformer, 1, &current, past, 1);
-
+    STOP_1(st, FORWARD_TIME_GENERATION);
     end = time_in_ms();
     decode_time += (end - start) / 1000.0;
     start = end;
-
+    START(st);
     next = sampler_sample(sampler, logits);
+    STOP_1(st, SAMPLE_TIME);
     generated_count++;
     past++;
 
@@ -1354,13 +1412,13 @@ void generate(
     }
 
     // Print the token as string, decode it with the tokenizer_t object
-    char* piece = tokenizer_decode(tokenizer, current, next);
-    safe_printf(piece);
-    fflush(stdout);
+    /*  char* piece = tokenizer_decode(tokenizer, current, next);
+     safe_printf(piece);
+     fflush(stdout); */
   }
-  printf("\n");
 
   // Report achieved tok/s
+
   if (past > 2) {
     fprintf(
         stderr,
@@ -1377,7 +1435,7 @@ void generate(
         (generated_count - 1) / decode_time
     );
   }
-
+  ADD_1(generated_count, TOKEN_GENERATED);
   free(sequence);
 }
 
@@ -1494,7 +1552,7 @@ int main(int argc, char* argv[]) {
   fprintf(stderr, "- kv_head_count:  %d\n", transformer.config.kv_head_count);
   fprintf(stderr, "- vocabulary_len: %d\n", transformer.config.vocabulary_len);
   fprintf(stderr, "- context_len:    %d\n", transformer.config.context_len);
-  int vocabulary_len = transformer.config.vocabulary_len; 
+  int vocabulary_len = transformer.config.vocabulary_len;
 
   // Build the tokenizer_t via the tokenizer .bin file
   tokenizer_t tokenizer;
@@ -1508,9 +1566,14 @@ int main(int argc, char* argv[]) {
   if (steps == 0 || steps > transformer.config.context_len) {
     steps = transformer.config.context_len;
   }
+  LET_TAB(let_tab_instr(N_InstrStop1ID_VALUES));
+  LET_TAB(let_tab_compt_instr(N_InstrAdd1ID_VALUES));
+  LET_TAB(let_tab_instr_2(N_InstrStop2ID_VALUES,count_words(prompt) + steps));
+
   generate(&transformer, &tokenizer, &sampler, prompt, steps);
 
   // Memory and file handles cleanup
+  PRINT_JSON(string_values_1_add,string_values_1,string_values_2,string_values_3);
   sampler_free(&sampler);
   tokenizer_free(&tokenizer);
   transformer_free(&transformer);

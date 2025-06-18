@@ -7,6 +7,8 @@ CC = gcc
 clift: clift.c
 	$(CC) -O3 -ffast-math -fno-omit-frame-pointer -Wall -o clift clift.c -lm
 
+cliftinstr : clift.c
+	$(CC) -DINSTR -O3 -ffast-math -fno-omit-frame-pointer -Wall -o cliftinstr clift.c -lm
 # Useful to debug memory issues, e.g. with Clang's address sanitizer.
 .PHONY: asan
 asan: clift.c
@@ -22,7 +24,7 @@ debug: clift.c
 # OMP_NUM_THREADS=4 ./clift out/model.bin
 .PHONY: cliftomp
 omp: clift.c
-	$(CC) -Ofast -fopenmp -march=native clift.c  -lm  -o clift
+	$(CC) -Ofast -fopenmp -march=native clift.c  -lm  -o cliftomp
 
 # compiles with gnu99 standard flags for amazon linux, coreos, etc. compatibility
 .PHONY: cliftgnu
@@ -36,3 +38,4 @@ ompgnu:
 .PHONY: clean
 clean:
 	rm -f clift
+	rm -f cliftinstr
