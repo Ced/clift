@@ -1398,7 +1398,7 @@ void generate(
       generated_count++;
     }
   }
-
+  start = time_in_ms();
   // Then generate tokens one by one
   while (generated_count < steps) {
     // Forward the transformer to get logits for the next token
