@@ -12,6 +12,12 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#else
+#define omp_set_num_threads(a)
+#endif
+
 // ----------------------------------------------------------------------------
 // Utilities
 
@@ -424,7 +430,7 @@ void rope(
   }
 }
 
-float* transformer_forward(
+void transformer_forward(
     int sequence_len,
     int* sequence,
     int vocabulary_len,
@@ -451,9 +457,9 @@ float* transformer_forward(
                       [embedding_dim],
     float mha_out_weight[restrict layer_count][embedding_dim][embedding_dim],
     float ffn_norm_weight[restrict layer_count][embedding_dim],
-    float ffn_fc_weight[restrict layer_count][embedding_dim][hidden_dim],
-    float ffn_up_weight[restrict layer_count][embedding_dim][hidden_dim],
-    float ffn_out_weight[restrict layer_count][hidden_dim][embedding_dim],
+    float ffn_fc_weight[restrict layer_count][hidden_dim][embedding_dim],
+    float ffn_up_weight[restrict layer_count][hidden_dim][embedding_dim],
+    float ffn_out_weight[restrict layer_count][embedding_dim][hidden_dim],
     float out_norm_weight[restrict embedding_dim],
     float out_weight[restrict vocabulary_len][embedding_dim],
 
@@ -698,11 +704,352 @@ float* transformer_forward(
       embedding + sequence_len - logits_count,
       out_weight
   );
-
-  return &logits[sequence_len - logits_count][0];
 }
 
-float* transformer_driver(
+void transformer_forward_inlined(
+    int token_count,
+    int* token,
+    int vocabulary_len,
+    int context_len,
+    int layer_count,
+    int q_head_count,
+    int kv_head_count,
+    int q_head_per_kv_head_count,
+    int embedding_dim,
+    int head_dim,
+    int q_dim,
+    int kv_dim,
+    int hidden_dim,
+
+    float epsilon,
+
+    float embedding_weight[restrict vocabulary_len][embedding_dim],
+    float mha_norm_weight[restrict layer_count][embedding_dim],
+    float mha_q_weight[restrict layer_count][kv_head_count]
+                      [q_head_per_kv_head_count][head_dim][embedding_dim],
+    float mha_k_weight[restrict layer_count][kv_head_count][head_dim]
+                      [embedding_dim],
+    float mha_v_weight[restrict layer_count][kv_head_count][head_dim]
+                      [embedding_dim],
+    float mha_out_weight[restrict layer_count][embedding_dim][embedding_dim],
+    float ffn_norm_weight[restrict layer_count][embedding_dim],
+    float ffn_fc_weight[restrict layer_count][hidden_dim][embedding_dim],
+    float ffn_up_weight[restrict layer_count][hidden_dim][embedding_dim],
+    float ffn_out_weight[restrict layer_count][embedding_dim][hidden_dim],
+    float out_norm_weight[restrict embedding_dim],
+    float out_weight[restrict vocabulary_len][embedding_dim],
+
+    float embedding[restrict SEQUENCE_CHUNK_MAX_LEN][embedding_dim],
+    float mha_norm[restrict SEQUENCE_CHUNK_MAX_LEN][embedding_dim],
+    float mha_q[restrict kv_head_count][q_head_per_kv_head_count]
+               [SEQUENCE_CHUNK_MAX_LEN][head_dim],
+    float k_cache[restrict layer_count][kv_head_count][context_len][head_dim],
+    float v_cache[restrict layer_count][kv_head_count][context_len][head_dim],
+    float rope_cos_sin[restrict context_len][head_dim],
+    float mha_score[restrict kv_head_count][q_head_per_kv_head_count]
+                   [context_len][context_len],
+    float mha_blend[restrict kv_head_count][q_head_per_kv_head_count]
+                   [SEQUENCE_CHUNK_MAX_LEN][head_dim],
+    float mha_att[restrict SEQUENCE_CHUNK_MAX_LEN][embedding_dim],
+    float mha_out[restrict SEQUENCE_CHUNK_MAX_LEN][embedding_dim],
+    float ffn_norm[restrict SEQUENCE_CHUNK_MAX_LEN][embedding_dim],
+    float ffn_fc[restrict SEQUENCE_CHUNK_MAX_LEN][hidden_dim],
+    float ffn_up[restrict SEQUENCE_CHUNK_MAX_LEN][hidden_dim],
+    float ffn_out[restrict SEQUENCE_CHUNK_MAX_LEN][embedding_dim],
+    float logits[restrict SEQUENCE_CHUNK_MAX_LEN][vocabulary_len],
+    int past,
+    int logits_count
+) {
+  // Get embedding representation of each token in the token sequence
+  #pragma omp single
+  for (int t = 0; t < token_count; t++) {
+    for (int e = 0; e < embedding_dim; e++) {
+      embedding[t][e] = embedding_weight[token[t]][e];
+    }
+  }
+
+  // Forward all the layers
+  for (int l = 0; l < layer_count; l++) {
+
+    // Attention rmsnorm
+    #pragma omp single
+    for (int t = 0; t < token_count; t++) {
+      // Calculate sum of squares
+      float ss = 0.0f;
+      for (int e = 0; e < embedding_dim; e++) {
+        ss += embedding[t][e] * embedding[t][e];
+      }
+      ss /= embedding_dim;
+      ss += epsilon;
+      ss = 1.0f / sqrtf(ss);
+      // Normalize and scale
+      for (int e = 0; e < embedding_dim; e++) {
+        mha_norm[t][e] = mha_norm_weight[l][e] * (ss * embedding[t][e]);
+      }
+    }
+
+    // QKV matmuls for this position
+    #pragma omp for collapse(2) nowait
+    for (int k = 0; k < kv_head_count; k++) {
+      for (int t = 0; t < token_count; t++) {
+        for (int h = 0; h < head_dim; h++) {
+          k_cache[l][k][t + past][h] = 0.0f;
+          for (int e = 0; e < embedding_dim; e++) {
+            k_cache[l][k][t + past][h] += mha_norm[t][e] * mha_k_weight[l][k][h][e];
+          }
+        }
+      }
+    }
+
+    // RoPE k: complex-valued rotate k in each head
+    #pragma omp for collapse(2) nowait
+    for (int k = 0; k < kv_head_count; k++) {
+      for (int t = 0; t < token_count; t++) {
+        for (int h = 0; h < head_dim; h += 2) {
+          float fcr = rope_cos_sin[past + t][h + 0];
+          float fci = rope_cos_sin[past + t][h + 1];
+          float v0 = k_cache[l][k][t + past][h + 0];
+          float v1 = k_cache[l][k][t + past][h + 1];
+          k_cache[l][k][t + past][h + 0] = v0 * fcr - v1 * fci;
+          k_cache[l][k][t + past][h + 1] = v0 * fci + v1 * fcr;
+        }
+      }
+    }
+
+    #pragma omp for collapse(2) nowait
+    for (int k = 0; k < kv_head_count; k++) {
+      for (int t = 0; t < token_count; t++) {
+        for (int h = 0; h < head_dim; h++) {
+          v_cache[l][k][t + past][h] = 0.0f;
+          for (int e = 0; e < embedding_dim; e++) {
+            v_cache[l][k][t + past][h] += mha_norm[t][e] * mha_v_weight[l][k][h][e];
+          }
+        }
+      }
+    }
+
+    #pragma omp barrier
+
+    #pragma omp for collapse(3) nowait
+    for (int k = 0; k < kv_head_count; k++) {
+      for (int q = 0; q < q_head_per_kv_head_count; q++) {
+        for (int t = 0; t < token_count; t++) {
+          for (int h = 0; h < head_dim; h++) {
+            mha_q[k][q][t][h] = 0.0f;
+            for (int e = 0; e < embedding_dim; e++) {
+              mha_q[k][q][t][h] += mha_norm[t][e] * mha_q_weight[l][k][q][h][e];
+            }
+          }
+        }
+      }
+    }
+
+    // RoPE q: complex-valued rotate q in each head
+    #pragma omp for collapse(3) nowait
+    for (int k = 0; k < kv_head_count; k++) {
+      for (int q = 0; q < q_head_per_kv_head_count; q++) {
+        for (int t = 0; t < token_count; t++) {
+          for (int h = 0; h < head_dim; h += 2) {
+            float fcr = rope_cos_sin[past + t][h + 0];
+            float fci = rope_cos_sin[past + t][h + 1];
+            float v0 = mha_q[k][q][t][h + 0];
+            float v1 = mha_q[k][q][t][h + 1];
+            mha_q[k][q][t][h + 0] = v0 * fcr - v1 * fci;
+            mha_q[k][q][t][h + 1] = v0 * fci + v1 * fcr;
+          }
+        }
+      }
+    }
+
+    // Multihead attention. iterate over all heads
+    #pragma omp for collapse(3) nowait
+    for (int k = 0; k < kv_head_count; k++) {
+      for (int q = 0; q < q_head_per_kv_head_count; q++) {
+        for (int t = 0; t < token_count; t++) {
+          // Iterate over all timesteps, including the current one and
+          // calculate the attention score as the dot product of q and k
+          for (int s = 0; s <= past + t; s++) {
+            mha_score[k][q][t][s] = 0.0f;
+            for (int e = 0; e < head_dim; e++) {
+              mha_score[k][q][t][s] += mha_q[k][q][t][e] * k_cache[l][k][s][e];
+            }
+            mha_score[k][q][t][s] /= sqrtf(head_dim);
+          }
+
+          // Softmax the scores to get attention weights
+          // - Find max value (for numerical stability)
+          float max_val = mha_score[k][q][t][0];
+          for (int s = 1; s < past + t + 1; s++) {
+            if (mha_score[k][q][t][s] > max_val) {
+              max_val = mha_score[k][q][t][s];
+            }
+          }
+          // - Exp and sum
+          float sum = 0.0f;
+          for (int s = 0; s < past + t + 1; s++) {
+            mha_score[k][q][t][s] = expf(mha_score[k][q][t][s] - max_val);
+            sum += mha_score[k][q][t][s];
+          }
+          // - Normalize
+          for (int s = 0; s < past + t + 1; s++) {
+            mha_score[k][q][t][s] /= sum;
+          }
+
+          // Weighted sum of the values
+          for (int e = 0; e < head_dim; e++) {
+            mha_blend[k][q][t][e] = 0.0f;
+          }
+          for (int s = 0; s < past + t + 1; s++) {
+            for (int e = 0; e < head_dim; e++) {
+              mha_blend[k][q][t][e] +=
+                  mha_score[k][q][t][s] * v_cache[l][k][s][e];
+            }
+          }
+        }
+      }
+    }
+
+    #pragma omp for collapse(3) nowait
+    for (int k = 0; k < kv_head_count; k++) {
+      for (int q = 0; q < q_head_per_kv_head_count; q++) {
+        for (int t = 0; t < token_count; t++) {
+          for (int h = 0; h < head_dim; h++) {
+            mha_att[t][(k * q_head_per_kv_head_count + q) * head_dim + h] =
+                mha_blend[k][q][t][h];
+          }
+        }
+      }
+    }
+
+    #pragma omp barrier
+
+    // Final matmul to get the output of the attention
+    #pragma omp for collapse(2) nowait
+    for (int t = 0; t < token_count; t++) {
+      for (int e = 0; e < embedding_dim; e++) {
+        mha_out[t][e] = 0.0f;
+        for (int h = 0; h < embedding_dim; h++) {
+          mha_out[t][e] += mha_att[t][h] * mha_out_weight[l][e][h];
+        }
+      }
+    }
+
+    // Residual connection back into x
+    #pragma omp for collapse(2) nowait
+    for (int t = 0; t < token_count; t++) {
+      for (int e = 0; e < embedding_dim; e++) {
+        embedding[t][e] += mha_out[t][e];
+      }
+    }
+
+    #pragma omp barrier
+
+    // FFN rmsnorm
+    #pragma omp single
+    for (int i = 0; i < token_count; i++) {
+      // Calculate sum of squares
+      float ss = 0.0f;
+      for (int j = 0; j < embedding_dim; j++) {
+        ss += embedding[i][j] * embedding[i][j];
+      }
+      ss /= embedding_dim;
+      ss += epsilon;
+      ss = 1.0f / sqrtf(ss);
+      // Normalize and scale
+      for (int j = 0; j < embedding_dim; j++) {
+        ffn_norm[i][j] = ffn_norm_weight[l][j] * (ss * embedding[i][j]);
+      }
+    }
+
+    // Now for FFN in PyTorch we have:
+    // ffn_out_weight(F.silu(ffn_fc_weight(x)) * ffn_up_weight(x))
+    // First calculate ffn_fc_weight(x) and ffn_up_weight(x)
+    #pragma omp for collapse(2) nowait
+    for (int t = 0; t < token_count; t++) {
+      for (int h = 0; h < hidden_dim; h++) {
+        ffn_fc[t][h] = 0.0f;
+        for (int e = 0; e < embedding_dim; e++) {
+          ffn_fc[t][h] += ffn_norm[t][e] * ffn_fc_weight[l][h][e];
+        }
+      }
+    }
+
+    #pragma omp for collapse(2) nowait
+    for (int t = 0; t < token_count; t++) {
+      for (int h = 0; h < hidden_dim; h++) {
+        ffn_up[t][h] = 0.0f;
+        for (int e = 0; e < embedding_dim; e++) {
+          ffn_up[t][h] += ffn_norm[t][e] * ffn_up_weight[l][h][e];
+        }
+      }
+    }
+
+    // SwiGLU non-linearity
+    #pragma omp for collapse(2) nowait
+    for (int t = 0; t < token_count; t++) {
+      for (int h = 0; h < hidden_dim; h++) {
+        // SiLU(x)=x*σ(x), where σ(x) is the logistic sigmoid
+        ffn_fc[t][h] *= (1.0f / (1.0f + expf(-ffn_fc[t][h])));
+        // Elementwise multiply with ffn_up_weight(x)
+        ffn_fc[t][h] *= ffn_up[t][h];
+      }
+    }
+
+    #pragma omp barrier
+
+    // Final matmul to get the output of the ffn
+    #pragma omp for collapse(2) nowait
+    for (int t = 0; t < token_count; t++) {
+      for (int e = 0; e < embedding_dim; e++) {
+        ffn_out[t][e] = 0.0f;
+        for (int h = 0; h < hidden_dim; h++) {
+          ffn_out[t][e] += ffn_fc[t][h] * ffn_out_weight[l][e][h];
+        }
+      }
+    }
+
+    // Residual connection
+    #pragma omp for collapse(2) nowait
+    for (int t = 0; t < token_count; t++) {
+      for (int e = 0; e < embedding_dim; e++) {
+        embedding[t][e] += ffn_out[t][e];
+      }
+    }
+
+    #pragma omp barrier
+  }
+
+  // Final rmsnorm
+  #pragma omp single
+  for (int i = 0; i < token_count; i++) {
+    // Calculate sum of squares
+    float ss = 0.0f;
+    for (int j = 0; j < embedding_dim; j++) {
+      ss += embedding[i][j] * embedding[i][j];
+    }
+    ss /= embedding_dim;
+    ss += epsilon;
+    ss = 1.0f / sqrtf(ss);
+    // Normalize and scale
+    for (int j = 0; j < embedding_dim; j++) {
+      embedding[i][j] = out_norm_weight[j] * (ss * embedding[i][j]);
+    }
+  }
+
+  // Classifier into logits
+  #pragma omp for collapse(2)
+  for (int l = 0; l < logits_count; l++) {
+    for (int v = 0; v < vocabulary_len; v++) {
+      logits[l + token_count - logits_count][v] = 0.0f;
+      for (int e = 0; e < embedding_dim; e++) {
+        logits[l + token_count - logits_count][v] +=
+            embedding[l + token_count - logits_count][e] * out_weight[v][e];
+      }
+    }
+  }
+}
+
+void transformer_driver(
     transformer_t* transformer,
     int sequence_len,
     int* sequence,
@@ -724,7 +1071,7 @@ float* transformer_driver(
   int kv_dim = head_dim * kv_head_count;
   int hidden_dim = c->hidden_dim;
 
-  return transformer_forward(
+  transformer_forward_inlined(
       sequence_len,
       sequence,
       vocabulary_len,
@@ -748,9 +1095,9 @@ float* transformer_driver(
       (float (*)[kv_head_count][head_dim][embedding_dim])p->mha_v_weight,
       (float (*)[embedding_dim][embedding_dim])p->mha_out_weight,
       (float (*)[embedding_dim])p->ffn_norm_weight,
-      (float (*)[embedding_dim][hidden_dim])p->ffn_fc_weight,
-      (float (*)[embedding_dim][hidden_dim])p->ffn_up_weight,
-      (float (*)[hidden_dim][embedding_dim])p->ffn_out_weight,
+      (float (*)[hidden_dim][embedding_dim])p->ffn_fc_weight,
+      (float (*)[hidden_dim][embedding_dim])p->ffn_up_weight,
+      (float (*)[embedding_dim][hidden_dim])p->ffn_out_weight,
       (float (*))p->out_norm_weight,
       (float (*)[embedding_dim])p->out_weight,
 
@@ -1262,6 +1609,11 @@ void generate(
   }
   fprintf(stderr, "\n");
 
+  int next; // Will store the next token in the sequence
+
+  // Cache warmup
+  transformer_driver(transformer, 1, sequence, 0, 1);
+
   // Print the prompt string
   fprintf(stderr, "\033[1;34m");
   while (*prompt) {
@@ -1270,13 +1622,10 @@ void generate(
   }
   fprintf(stderr, "\033[0m");
 
-  int next; // Will store the next token in the sequence
-
-  // Cache warmup
-  transformer_driver(transformer, 1, sequence, 0, 1);
-
   size_t generated_count = 0; // Number of tokens generated so far
   size_t past = 0;            // Number of tokens already processed
+  size_t vocabulary_len = transformer->config.vocabulary_len;
+  size_t logits_offset = (sequence_len - 1) * vocabulary_len;
 
   // Input token sequence must not be empty
   if (sequence_len == 0) {
@@ -1295,58 +1644,74 @@ void generate(
   size_t remaining_sequence_len = sequence_len;
   size_t chunk_len = MIN(remaining_sequence_len, SEQUENCE_CHUNK_MAX_LEN);
   start = time_in_ms();
-  while (chunk_len != 0) {
-    // We only compute the very last logits
-    int logits_count = (remaining_sequence_len - chunk_len == 0) ? 1 : 0;
 
-    // Run the transformer to fill the KV-cache and get final logits
-    float* logits =
-        transformer_driver(transformer, chunk_len, chunk, past, logits_count);
+  #pragma omp parallel
+  {
+    while (chunk_len != 0) {
+      // We only compute the very last logits
+      int logits_count = (remaining_sequence_len - chunk_len == 0) ? 1 : 0;
 
-    remaining_sequence_len -= chunk_len;
-    chunk += chunk_len;
-    past += chunk_len;
-    chunk_len = MIN(remaining_sequence_len, SEQUENCE_CHUNK_MAX_LEN);
+      // Run the transformer to fill the KV-cache and get final logits
+      transformer_driver(transformer, chunk_len, chunk, past, logits_count);
 
-    // First token generation after the prompt has been processed
-    if (chunk_len == 0) {
-      end = time_in_ms();
-      prefill_time = (end - start) / 1000.0;
+      #pragma omp single
+      {
+        remaining_sequence_len -= chunk_len;
+        chunk += chunk_len;
+        past += chunk_len;
+        chunk_len = MIN(remaining_sequence_len, SEQUENCE_CHUNK_MAX_LEN);
 
-      next = sampler_sample(sampler, logits);
-      // print the token as string, decode it with the tokenizer_t object
-      int current = sequence[sequence_len - 1];
-      char* piece = tokenizer_decode(tokenizer, current, next);
-      safe_printf(piece); // Safe printf("%s", piece)
-      fflush(stdout);
-      generated_count++;
-    }
-  }
+        // First token generation after the prompt has been processed
+        if (chunk_len == 0) {
+          end = time_in_ms();
+          prefill_time = (end - start) / 1000.0;
 
-  // Then generate tokens one by one
-  while (generated_count < steps) {
-    // Forward the transformer to get logits for the next token
-    int current = next;
-
-    start = time_in_ms();
-    float* logits = transformer_driver(transformer, 1, &current, past, 1);
-    end = time_in_ms();
-    decode_time += (end - start) / 1000.0;
-
-    next = sampler_sample(sampler, logits);
-    generated_count++;
-    past++;
-
-    // Data-dependent terminating condition: the BOS (=1) token delimits
-    // sequences
-    if (next == 1) {
-      break;
+          float* logits = transformer->state.logits + logits_offset;
+          next = sampler_sample(sampler, logits);
+          // print the token as string, decode it with the tokenizer_t object
+          int current = sequence[sequence_len - 1];
+          char* piece = tokenizer_decode(tokenizer, current, next);
+          safe_printf(piece); // Safe printf("%s", piece)
+          fflush(stdout);
+          generated_count++;
+        }
+      }
     }
 
-    // Print the token as string, decode it with the tokenizer_t object
-    char* piece = tokenizer_decode(tokenizer, current, next);
-    safe_printf(piece);
-    fflush(stdout);
+    // Then generate tokens one by one
+    while (generated_count < steps) {
+      // Forward the transformer to get logits for the next token
+      int current = next;
+
+      #pragma omp single
+      {
+        start = time_in_ms();
+      }
+
+      transformer_driver(transformer, 1, &current, past, 1);
+
+      #pragma omp single
+      {
+        end = time_in_ms();
+        decode_time += (end - start) / 1000.0;
+
+        next = sampler_sample(sampler, transformer->state.logits);
+        generated_count++;
+        past++;
+
+        if (next != TOKEN_EOS) {
+          // Print the token as string, decode it with the tokenizer_t object
+          char* piece = tokenizer_decode(tokenizer, current, next);
+          safe_printf(piece);
+          fflush(stdout);
+        }
+      }
+
+      // Data-dependent terminating condition: the EOS token delimits sequences
+      if (next == TOKEN_EOS) {
+        break;
+      }
+    }
   }
   printf("\n");
 
@@ -1379,11 +1744,13 @@ void error_usage(char* argv[]) {
   fprintf(stderr, "Usage: %s [options]\n", argv[0]);
   fprintf(stderr, "Example: %s -m model.bin -n 32 -p \"42 is the\"\n", argv[0]);
   fprintf(stderr, "Options:\n");
+  fprintf(stderr, "  -f <path>       read prompt from file\n");
   fprintf(stderr, "  -h, --help      print usage and exit\n");
   fprintf(stderr, "  -m <path>       model file (default model.bin)\n");
   fprintf(stderr, "  -n <int>        num of tokens to predict (default 256)\n");
   fprintf(stderr, "  -p <string>     input prompt\n");
   fprintf(stderr, "  -s <int>        random seed (default time(NULL))\n");
+  fprintf(stderr, "  -t <int>        set the number of threads (default 8)\n");
   fprintf(stderr, "  --temp <float>  temperature in [0, inf] (default 1.0)\n");
   fprintf(stderr, "  --top-p <float> top-p sampling in [0, 1] (default 0.9)\n");
   fprintf(stderr, "  -z <path>       tokenizer file (default tokenizer.bin)\n");
@@ -1401,14 +1768,23 @@ int main(int argc, char* argv[]) {
   float topp = 0.9f;
   // Number of steps (number of predicted tokens) to run for
   int steps = 256;
-  // Prompt string
+  // Prompt string or file
   char* prompt = "Once upon a time, ";
+  char* prompt_file = NULL;
   // Seed rng with time by default
   unsigned long long rng_seed = 0;
+  // Set the number of threads to use for OpenMP
+  int num_threads = 8;
 
   // Poor man's C argparse
   for (int i = 1; i < argc; i += 2) {
-    if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+    if (strcmp(argv[i], "-f") == 0) {
+      if (i + 1 < argc) {
+        prompt_file = argv[i + 1];
+      } else {
+        error_usage(argv);
+      }
+    } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
       error_usage(argv);
     } else if (strcmp(argv[i], "-m") == 0) {
       if (i + 1 < argc) {
@@ -1431,6 +1807,17 @@ int main(int argc, char* argv[]) {
     } else if (strcmp(argv[i], "-s") == 0) {
       if (i + 1 < argc) {
         rng_seed = strtoull(argv[i + 1], NULL, 10);
+      } else {
+        error_usage(argv);
+      }
+    } else if (strcmp(argv[i], "-t") == 0) {
+      if (i + 1 < argc) {
+        int thread_count = atoi(argv[i + 1]);
+        if (thread_count <= 0) {
+          fprintf(stderr, "Invalid number of threads: %d\n", thread_count);
+          exit(EXIT_FAILURE);
+        }
+        num_threads = thread_count;
       } else {
         error_usage(argv);
       }
@@ -1470,6 +1857,33 @@ int main(int argc, char* argv[]) {
   if (steps < 0) {
     steps = 0;
   }
+  if (prompt_file != NULL) {
+    FILE* pf = fopen(prompt_file, "rb");
+    if (!pf) {
+      fprintf(stderr, "Could not open prompt file: %s\n", prompt_file);
+      exit(EXIT_FAILURE);
+    }
+    fseek(pf, 0, SEEK_END);
+    long fsize = ftell(pf);
+    fseek(pf, 0, SEEK_SET);
+    char* file_prompt = malloc(fsize + 1);
+    if (!file_prompt) {
+      fprintf(stderr, "Failed to allocate memory for prompt file\n");
+      exit(EXIT_FAILURE);
+    }
+    fread(file_prompt, 1, fsize, pf);
+    fclose(pf);
+    file_prompt[fsize] = '\0';
+    // Strip trailing newline if present
+    if (fsize > 0 && file_prompt[fsize - 1] == '\n') {
+      file_prompt[fsize - 1] = '\0';
+    }
+    prompt = file_prompt;
+  }
+
+  // Set OpenMP parameters
+  setenv("OMP_WAIT_POLICY", "ACTIVE", 1);
+  omp_set_num_threads(num_threads);
 
   // Build the transformer_t via the model .bin file
   transformer_t transformer;
@@ -1484,6 +1898,8 @@ int main(int argc, char* argv[]) {
   fprintf(stderr, "- kv_head_count:  %d\n", transformer.config.kv_head_count);
   fprintf(stderr, "- vocabulary_len: %d\n", transformer.config.vocabulary_len);
   fprintf(stderr, "- context_len:    %d\n", transformer.config.context_len);
+  fprintf(stderr, "runtime setup:\n");
+  fprintf(stderr, "- num_threads:    %d\n", num_threads);
   int vocabulary_len = transformer.config.vocabulary_len; 
 
   // Build the tokenizer_t via the tokenizer .bin file
@@ -1504,6 +1920,9 @@ int main(int argc, char* argv[]) {
   sampler_free(&sampler);
   tokenizer_free(&tokenizer);
   transformer_free(&transformer);
+  if (prompt_file != NULL) {
+    free(prompt);
+  }
   return EXIT_SUCCESS;
 }
 #endif

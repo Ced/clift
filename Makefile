@@ -2,6 +2,9 @@
 # example override to clang: make clift CC=clang
 CC = gcc
 
+HOMEBREW_CLANG = /opt/homebrew/opt/llvm/bin/clang
+HOMEBREW_FLAGS = -L/opt/homebrew/opt/llvm/lib -L/opt/homebrew/opt/libomp/lib
+
 # the most basic way of building that is most likely to work on most systems
 .PHONY: clift
 clift: clift.c
@@ -20,9 +23,9 @@ debug: clift.c
 # additionally compiles with OpenMP, allowing multithreaded clifts
 # make sure to also enable multiple threads when cliftning, e.g.:
 # OMP_NUM_THREADS=4 ./clift out/model.bin
-.PHONY: cliftomp
+.PHONY: omp
 omp: clift.c
-	$(CC) -Ofast -fopenmp -march=native clift.c  -lm  -o clift
+	$(HOMEBREW_CLANG) $(HOMEBREW_FLAGS) -O3 -ffast-math -fno-omit-frame-pointer -Wall -fopenmp -march=native clift.c  -lm  -o clift
 
 # compiles with gnu99 standard flags for amazon linux, coreos, etc. compatibility
 .PHONY: cliftgnu
