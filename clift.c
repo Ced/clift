@@ -21,52 +21,56 @@ typedef enum {
 } InstrAdd1ID;
 char* string_values_1_add[] = {"PROMPT_LEN", "TOKEN_GENERATED"};
 typedef enum {
-  ENCODE_TIME = 0,
-  FORWARD_TIME_GENERATION = 1,
-  FORWARD_TIME_PROMPT = 2,
-  SAMPLE_TIME = 3,
-  N_InstrStop1ID_VALUES
+    ENCODE_TIME = 0,
+    FORWARD_TIME_PROMPT = 1,
+    SAMPLE_TIME = 2,
+    FORWARD_TIME_GENERATION = 3,
+    N_InstrStop1ID_VALUES
 } InstrStop1ID;
 
 char* string_values_1[] = {
     "ENCODE_TIME",
-    "FORWARD_TIME_GENERATION",
     "FORWARD_TIME_PROMPT",
-    "SAMPLE_TIME"
+    "SAMPLE_TIME",
+    "FORWARD_TIME_GENERATION",
 };
 
 typedef enum {
-  FFN_RMSNORM = 0,
-  FINAL_RMSNORM = 1,
-  MAMTUL_LOGITS = 2,
-  MATMUL_FFN = 3,
-  MATMUL_OUTPUT_ATTENTION = 4,
-  MATMUL_OUTPUT_FFN = 5,
-  MATMUL_QKV = 6,
-  ATTENTION_COMPUTATION = 7,
-  RMSNORM_INIT = 8,
-  ROPE = 9,
-  SwiGLU = 10,
-  N_InstrStop2ID_VALUES
+    RMSNORM_INIT = 0,
+    MATMUL_QKV = 1,
+    ROPE = 2,
+    ATTENTION_COMPUTATION = 3,
+    MATMUL_OUTPUT_ATTENTION = 4,
+    FFN_RMSNORM = 5,
+    MATMUL_FFN = 6,
+    SwiGLU = 7,
+    MATMUL_OUTPUT_FFN = 8,
+    FINAL_RMSNORM = 9,
+    MAMTUL_LOGITS = 10,
+    N_InstrStop2ID_VALUES
 } InstrStop2ID;
 
 char* string_values_2[] = {
+    "RMSNORM_INIT",
+    "MATMUL_QKV",
+    "ROPE",
+    "ATTENTION_COMPUTATION",
+    "MATMUL_OUTPUT_ATTENTION",
     "FFN_RMSNORM",
+    "MATMUL_FFN",
+    "SwiGLU",
+    "MATMUL_OUTPUT_FFN",
     "FINAL_RMSNORM",
     "MAMTUL_LOGITS",
-    "MATMUL_FFN",
-    "MATMUL_OUTPUT_ATTENTION",
-    "MATMUL_OUTPUT_FFN",
-    "MATMUL_QKV",
-    "MHA",
-    "RMSNORM_INIT",
-    "ROPE",
-    "SwiGLU",
 };
 
-typedef enum { N_InstrStop3ID_VALUES } InstrStop3ID;
+typedef enum {
+    N_InstrStop3ID_VALUES
+} InstrStop3ID;
+
 char* string_values_3[] = {
 };
+
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
