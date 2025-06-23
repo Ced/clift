@@ -5,3 +5,7 @@ sentencepiece==0.1.99
 torch==2.0.1
 tqdm==4.64.1
 wandb==0.15.5
+pyplot
+ipykernel
+pandas
+jupyter
