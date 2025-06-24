@@ -1,0 +1,8 @@
+*.bin
+measurements/
+__pycache__/
+clift
+cliftinstr
+cliftomp
+*.json
+go.sh

@@ -10,6 +10,9 @@ HOMEBREW_FLAGS = -L/opt/homebrew/opt/llvm/lib -L/opt/homebrew/opt/libomp/lib
 clift: clift.c
 	$(CC) -O3 -ffast-math -fno-omit-frame-pointer -Wall -o clift clift.c -lm
 
+.PHONY: cliftinstr
+cliftinstr: clift.c
+	$(CC) -O3 -ffast-math -fno-omit-frame-pointer -Wall -o clift clift.c -lm -DINSTR
 # Useful to debug memory issues, e.g. with Clang's address sanitizer.
 .PHONY: asan
 asan: clift.c
@@ -25,8 +28,11 @@ debug: clift.c
 # OMP_NUM_THREADS=4 ./clift out/model.bin
 .PHONY: omp
 omp: clift.c
-	$(HOMEBREW_CLANG) $(HOMEBREW_FLAGS) -O3 -ffast-math -fno-omit-frame-pointer -Wall -fopenmp -march=native clift.c  -lm  -o clift
+	$(CC) -O3 -ffast-math -fno-omit-frame-pointer -Wall -fopenmp -march=native clift.c  -lm  -o clift
 
+.PHONY: ompinstr
+ompinstr: clift.c
+	$(CC) -O3 -DINSTR -ffast-math -fno-omit-frame-pointer -Wall -fopenmp -march=native clift.c  -lm  -o cliftinstr
 # compiles with gnu99 standard flags for amazon linux, coreos, etc. compatibility
 .PHONY: cliftgnu
 gnu:
