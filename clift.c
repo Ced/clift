@@ -24,6 +24,7 @@
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
+static int compt = 0;
 typedef enum {
   PROMPT_LEN = 0,
   TOKEN_GENERATED = 1,
@@ -834,7 +835,7 @@ void transformer_forward_inlined(
         }
       }
 
-      STOP_2(st, RMSNORM_INIT, past);
+      STOP_2(st, RMSNORM_INIT,compt);
 
     } // QKV matmuls for this position
 
@@ -853,7 +854,7 @@ void transformer_forward_inlined(
       }
     }
 
-    STOP_3(st, MATMUL_QKV, omp_get_thread_num(), past);
+    STOP_3(st, MATMUL_QKV, omp_get_thread_num(), compt);
 
     START(st);
 // RoPE k: complex-valued rotate k in each head
@@ -870,7 +871,7 @@ void transformer_forward_inlined(
         }
       }
     }
-    STOP_3(st, ROPE, omp_get_thread_num(), past);
+    STOP_3(st, ROPE, omp_get_thread_num(), compt);
     START(st);
 
 #pragma omp for collapse(2) nowait
@@ -885,7 +886,7 @@ void transformer_forward_inlined(
         }
       }
     }
-    STOP_3(st, MATMUL_QKV, omp_get_thread_num(), past);
+    STOP_3(st, MATMUL_QKV, omp_get_thread_num(), compt);
 
 #pragma omp barrier
   START(st);
@@ -902,7 +903,7 @@ void transformer_forward_inlined(
         }
       }
     }
-    STOP_3(st,MATMUL_QKV,omp_get_thread_num(),past);
+    STOP_3(st,MATMUL_QKV,omp_get_thread_num(), compt);
 // RoPE q: complex-valued rotate q in each head
 START(st);
 #pragma omp for collapse(3) nowait
@@ -921,7 +922,7 @@ START(st);
       }
     }
 
-STOP_3(st,ROPE,omp_get_thread_num(),past);
+STOP_3(st,ROPE,omp_get_thread_num(),compt);
 // Multihead attention. iterate over all heads
 START(st);
 #pragma omp for collapse(3) nowait
@@ -982,7 +983,7 @@ START(st);
         }
       }
     }
-STOP_3(st,ATTENTION_COMPUTATION,omp_get_thread_num(),past);
+STOP_3(st,ATTENTION_COMPUTATION,omp_get_thread_num(),compt);
 #pragma omp barrier
 
 // Final matmul to get the output of the attention
@@ -996,7 +997,7 @@ START(st);
       }
     }
   }
-STOP_3(st,MATMUL_OUTPUT_ATTENTION,omp_get_thread_num(),past);
+STOP_3(st,MATMUL_OUTPUT_ATTENTION,omp_get_thread_num(),compt);
 // Residual connection back into x
 #pragma omp for collapse(2) nowait
   for (int t = 0; t < token_count; t++) {
@@ -1025,7 +1026,7 @@ STOP_3(st,MATMUL_OUTPUT_ATTENTION,omp_get_thread_num(),past);
       ffn_norm[i][j] = ffn_norm_weight[l][j] * (ss * embedding[i][j]);
     }
   }
-STOP_2(st,FFN_RMSNORM,past);
+STOP_2(st,FFN_RMSNORM,compt);
 }
 
 // Now for FFN in PyTorch we have:
@@ -1051,7 +1052,7 @@ START(st);
       }
     }
   }
-STOP_3(st,MATMUL_FFN,omp_get_thread_num(),past);
+STOP_3(st,MATMUL_FFN,omp_get_thread_num(),compt);
 
 START(st);
 // SwiGLU non-linearity
@@ -1064,7 +1065,7 @@ START(st);
       ffn_fc[t][h] *= ffn_up[t][h];
     }
   }
-STOP_3(st,SwiGLU,omp_get_thread_num(),past);
+STOP_3(st,SwiGLU,omp_get_thread_num(),compt);
 
 #pragma omp barrier
 
@@ -1079,7 +1080,7 @@ START(st);
       }
     }
   }
-STOP_3(st,MATMUL_OUTPUT_FFN,omp_get_thread_num(),past);
+STOP_3(st,MATMUL_OUTPUT_FFN,omp_get_thread_num(),compt);
 
 // Residual connection
 #pragma omp for collapse(2) nowait
@@ -1110,7 +1111,7 @@ for (int i = 0; i < token_count; i++) {
     embedding[i][j] = out_norm_weight[j] * (ss * embedding[i][j]);
   }
 }
-STOP_2(st,FINAL_RMSNORM,past);
+STOP_2(st,FINAL_RMSNORM,compt);
 
 }
 // Classifier into logits
@@ -1125,7 +1126,7 @@ for (int l = 0; l < logits_count; l++) {
     }
   }
 }
-STOP_3(st,MATMUL_LOGITS,omp_get_thread_num(),past);
+STOP_3(st,MATMUL_LOGITS,omp_get_thread_num(),compt);
 
 }
 
@@ -1730,7 +1731,7 @@ void generate(
   size_t remaining_sequence_len = sequence_len;
   size_t chunk_len = MIN(remaining_sequence_len, SEQUENCE_CHUNK_MAX_LEN);
   start = time_in_ms();
-
+  compt =1;
 #pragma omp parallel
   {
     while (chunk_len != 0) {
@@ -1773,7 +1774,7 @@ void generate(
       int current = next;
 
 #pragma omp single
-      { start = time_in_ms(); START(st);}
+      { compt++;start = time_in_ms(); START(st);}
 
       transformer_driver(transformer, 1, &current, past, 1);
 
@@ -2004,8 +2005,8 @@ int main(int argc, char* argv[]) {
   // Allocate +3 for '\0', ?BOS, ?EOS
   int* sequence = malloc((strlen(prompt) + 3) * sizeof(*sequence));
   tokenizer_encode(&tokenizer, prompt, 1, 0, sequence, &sequence_len);
-  LET_TAB(let_tab_instr_2(N_InstrStop2ID_VALUES, steps + sequence_len));
-  LET_TAB(let_tab_instr_3(N_InstrStop3ID_VALUES,num_threads, steps + sequence_len));
+  LET_TAB(let_tab_instr_2(N_InstrStop2ID_VALUES, steps + 1));
+  LET_TAB(let_tab_instr_3(N_InstrStop3ID_VALUES,num_threads, steps + 1));
   ADD_1(sequence_len, PROMPT_LEN);
 
   // Build the sampler_t
