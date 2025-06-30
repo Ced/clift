@@ -761,7 +761,7 @@ void transformer_forward_inlined(
     int logits_count
 ) {
   // Get embedding representation of each token in the token sequence
-  #pragma omp single
+  #pragma omp for
   for (int t = 0; t < token_count; t++) {
     for (int e = 0; e < embedding_dim; e++) {
       embedding[t][e] = embedding_weight[token[t]][e];
@@ -772,7 +772,7 @@ void transformer_forward_inlined(
   for (int l = 0; l < layer_count; l++) {
 
     // Attention rmsnorm
-    #pragma omp single
+    #pragma omp for
     for (int t = 0; t < token_count; t++) {
       // Calculate sum of squares
       float ss = 0.0f;
@@ -789,7 +789,7 @@ void transformer_forward_inlined(
     }
 
     // QKV matmuls for this position
-    #pragma omp for collapse(2) nowait
+    #pragma omp for collapse(2) schedule(static) nowait
     for (int k = 0; k < kv_head_count; k++) {
       for (int t = 0; t < token_count; t++) {
         for (int h = 0; h < head_dim; h++) {
@@ -802,7 +802,7 @@ void transformer_forward_inlined(
     }
 
     // RoPE k: complex-valued rotate k in each head
-    #pragma omp for collapse(2) nowait
+    #pragma omp for collapse(2) schedule(static) nowait
     for (int k = 0; k < kv_head_count; k++) {
       for (int t = 0; t < token_count; t++) {
         for (int h = 0; h < head_dim; h += 2) {
@@ -816,7 +816,7 @@ void transformer_forward_inlined(
       }
     }
 
-    #pragma omp for collapse(2) nowait
+    #pragma omp for collapse(2) schedule(static) nowait
     for (int k = 0; k < kv_head_count; k++) {
       for (int t = 0; t < token_count; t++) {
         for (int h = 0; h < head_dim; h++) {
@@ -830,7 +830,7 @@ void transformer_forward_inlined(
 
     #pragma omp barrier
 
-    #pragma omp for collapse(3) nowait
+    #pragma omp for collapse(3) schedule(static) nowait
     for (int k = 0; k < kv_head_count; k++) {
       for (int q = 0; q < q_head_per_kv_head_count; q++) {
         for (int t = 0; t < token_count; t++) {
@@ -845,7 +845,7 @@ void transformer_forward_inlined(
     }
 
     // RoPE q: complex-valued rotate q in each head
-    #pragma omp for collapse(3) nowait
+    #pragma omp for collapse(3) schedule(static) nowait
     for (int k = 0; k < kv_head_count; k++) {
       for (int q = 0; q < q_head_per_kv_head_count; q++) {
         for (int t = 0; t < token_count; t++) {
@@ -862,7 +862,7 @@ void transformer_forward_inlined(
     }
 
     // Multihead attention. iterate over all heads
-    #pragma omp for collapse(3) nowait
+    #pragma omp for collapse(3) schedule(static) nowait
     for (int k = 0; k < kv_head_count; k++) {
       for (int q = 0; q < q_head_per_kv_head_count; q++) {
         for (int t = 0; t < token_count; t++) {
@@ -909,7 +909,7 @@ void transformer_forward_inlined(
       }
     }
 
-    #pragma omp for collapse(3) nowait
+    #pragma omp for collapse(3) schedule(static) nowait
     for (int k = 0; k < kv_head_count; k++) {
       for (int q = 0; q < q_head_per_kv_head_count; q++) {
         for (int t = 0; t < token_count; t++) {
@@ -924,7 +924,7 @@ void transformer_forward_inlined(
     #pragma omp barrier
 
     // Final matmul to get the output of the attention
-    #pragma omp for collapse(2) nowait
+    #pragma omp for collapse(2) schedule(static) nowait
     for (int t = 0; t < token_count; t++) {
       for (int e = 0; e < embedding_dim; e++) {
         mha_out[t][e] = 0.0f;
@@ -935,7 +935,7 @@ void transformer_forward_inlined(
     }
 
     // Residual connection back into x
-    #pragma omp for collapse(2) nowait
+    #pragma omp for collapse(2) schedule(static) nowait
     for (int t = 0; t < token_count; t++) {
       for (int e = 0; e < embedding_dim; e++) {
         embedding[t][e] += mha_out[t][e];
@@ -945,7 +945,7 @@ void transformer_forward_inlined(
     #pragma omp barrier
 
     // FFN rmsnorm
-    #pragma omp single
+    #pragma omp for
     for (int i = 0; i < token_count; i++) {
       // Calculate sum of squares
       float ss = 0.0f;
@@ -964,7 +964,7 @@ void transformer_forward_inlined(
     // Now for FFN in PyTorch we have:
     // ffn_out_weight(F.silu(ffn_fc_weight(x)) * ffn_up_weight(x))
     // First calculate ffn_fc_weight(x) and ffn_up_weight(x)
-    #pragma omp for collapse(2) nowait
+    #pragma omp for collapse(2) schedule(static) nowait
     for (int t = 0; t < token_count; t++) {
       for (int h = 0; h < hidden_dim; h++) {
         ffn_fc[t][h] = 0.0f;
@@ -974,7 +974,7 @@ void transformer_forward_inlined(
       }
     }
 
-    #pragma omp for collapse(2) nowait
+    #pragma omp for collapse(2) schedule(static) nowait
     for (int t = 0; t < token_count; t++) {
       for (int h = 0; h < hidden_dim; h++) {
         ffn_up[t][h] = 0.0f;
@@ -985,7 +985,7 @@ void transformer_forward_inlined(
     }
 
     // SwiGLU non-linearity
-    #pragma omp for collapse(2) nowait
+    #pragma omp for collapse(2) schedule(static) nowait
     for (int t = 0; t < token_count; t++) {
       for (int h = 0; h < hidden_dim; h++) {
         // SiLU(x)=x*σ(x), where σ(x) is the logistic sigmoid
@@ -998,7 +998,7 @@ void transformer_forward_inlined(
     #pragma omp barrier
 
     // Final matmul to get the output of the ffn
-    #pragma omp for collapse(2) nowait
+    #pragma omp for collapse(2) schedule(static) nowait
     for (int t = 0; t < token_count; t++) {
       for (int e = 0; e < embedding_dim; e++) {
         ffn_out[t][e] = 0.0f;
@@ -1009,7 +1009,7 @@ void transformer_forward_inlined(
     }
 
     // Residual connection
-    #pragma omp for collapse(2) nowait
+    #pragma omp for collapse(2) schedule(static) nowait
     for (int t = 0; t < token_count; t++) {
       for (int e = 0; e < embedding_dim; e++) {
         embedding[t][e] += ffn_out[t][e];
@@ -1020,7 +1020,7 @@ void transformer_forward_inlined(
   }
 
   // Final rmsnorm
-  #pragma omp single
+  #pragma omp for
   for (int i = 0; i < token_count; i++) {
     // Calculate sum of squares
     float ss = 0.0f;
