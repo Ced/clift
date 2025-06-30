@@ -143,7 +143,7 @@ typedef struct {
   float* mha_q;        // [kv_head_count][q_head_per_kv_head_count][
                        //  chunk_len][head_dim]
   float* mha_score;    // [kv_head_count][q_head_per_kv_head_count][
-                       //  context_len][context_len]
+                       //  chunk_len][context_len]
   float* mha_blend;    // [kv_head_count][q_head_per_kv_head_count][
                        //  chunk_len][head_dim]
   float* mha_att;      // [chunk_len][embedding_dim]
@@ -174,7 +174,7 @@ void state_malloc(state_t* s, configuration_t* p) {
   size_t kv_dim = head_dim * p->kv_head_count;
   size_t embedding_len = SEQUENCE_CHUNK_MAX_LEN * p->embedding_dim;
   size_t hidden_len = SEQUENCE_CHUNK_MAX_LEN * p->hidden_dim;
-  size_t score_len = p->q_head_count * p->context_len * p->context_len;
+  size_t score_len = p->q_head_count * SEQUENCE_CHUNK_MAX_LEN * p->context_len;
   size_t cache_len = p->context_len * p->layer_count * kv_dim;
   size_t logits_len = SEQUENCE_CHUNK_MAX_LEN * p->vocabulary_len;
   size_t rope_len = p->context_len * head_dim;
@@ -471,7 +471,7 @@ void transformer_forward(
     float v_cache[restrict layer_count][kv_head_count][context_len][head_dim],
     float rope_cos_sin[restrict context_len][head_dim],
     float mha_score[restrict kv_head_count][q_head_per_kv_head_count]
-                   [context_len][context_len],
+                   [SEQUENCE_CHUNK_MAX_LEN][context_len],
     float mha_blend[restrict kv_head_count][q_head_per_kv_head_count]
                    [SEQUENCE_CHUNK_MAX_LEN][head_dim],
     float mha_att[restrict SEQUENCE_CHUNK_MAX_LEN][embedding_dim],
@@ -747,7 +747,7 @@ void transformer_forward_inlined(
     float v_cache[restrict layer_count][kv_head_count][context_len][head_dim],
     float rope_cos_sin[restrict context_len][head_dim],
     float mha_score[restrict kv_head_count][q_head_per_kv_head_count]
-                   [context_len][context_len],
+                   [SEQUENCE_CHUNK_MAX_LEN][context_len],
     float mha_blend[restrict kv_head_count][q_head_per_kv_head_count]
                    [SEQUENCE_CHUNK_MAX_LEN][head_dim],
     float mha_att[restrict SEQUENCE_CHUNK_MAX_LEN][embedding_dim],
@@ -868,7 +868,7 @@ void transformer_forward_inlined(
         for (int t = 0; t < token_count; t++) {
           // Iterate over all timesteps, including the current one and
           // calculate the attention score as the dot product of q and k
-          for (int s = 0; s <= past + t; s++) {
+          for (int s = 0; s < past + t + 1; s++) {
             mha_score[k][q][t][s] = 0.0f;
             for (int e = 0; e < head_dim; e++) {
               mha_score[k][q][t][s] += mha_q[k][q][t][e] * k_cache[l][k][s][e];
@@ -1197,7 +1197,7 @@ void tokenizer_free(tokenizer_t* t) {
   free(t->sorted_vocab);
 }
 
-char* tokenizer_decode(tokenizer_t* t, int prev_token, int token) {
+char* tokenizer_decode(tokenizer_t* t, int token) {
   char* piece = t->vocab[token];
 
   // cCreful, some tokens designate raw bytes, and look like e.g. '<0x01>'
@@ -1605,7 +1605,11 @@ void generate(
   // Print the prompt tokens
   fprintf(stderr, "Sequence (%d tokens):\n", sequence_len);
   for (int i = 0; i < sequence_len; i++) {
-    fprintf(stderr, "%d ", sequence[i]);
+    fprintf(stderr, "%d (\"", sequence[i]);
+    char* piece = tokenizer_decode(tokenizer, sequence[i]);
+    safe_printf(piece);
+    fflush(stdout);
+    fprintf(stderr, "\") ");
   }
   fprintf(stderr, "\n");
 
@@ -1667,10 +1671,10 @@ void generate(
           prefill_time = (end - start) / 1000.0;
 
           float* logits = transformer->state.logits + logits_offset;
+
           next = sampler_sample(sampler, logits);
           // print the token as string, decode it with the tokenizer_t object
-          int current = sequence[sequence_len - 1];
-          char* piece = tokenizer_decode(tokenizer, current, next);
+          char* piece = tokenizer_decode(tokenizer, next);
           safe_printf(piece); // Safe printf("%s", piece)
           fflush(stdout);
           generated_count++;
@@ -1701,7 +1705,7 @@ void generate(
 
         if (next != TOKEN_EOS) {
           // Print the token as string, decode it with the tokenizer_t object
-          char* piece = tokenizer_decode(tokenizer, current, next);
+          char* piece = tokenizer_decode(tokenizer, next);
           safe_printf(piece);
           fflush(stdout);
         }
@@ -1899,6 +1903,7 @@ int main(int argc, char* argv[]) {
   fprintf(stderr, "- vocabulary_len: %d\n", transformer.config.vocabulary_len);
   fprintf(stderr, "- context_len:    %d\n", transformer.config.context_len);
   fprintf(stderr, "runtime setup:\n");
+  fprintf(stderr, "- seed:           %llu\n", rng_seed);
   fprintf(stderr, "- num_threads:    %d\n", num_threads);
   int vocabulary_len = transformer.config.vocabulary_len; 
 
