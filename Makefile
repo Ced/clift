@@ -20,21 +20,15 @@ asan: clift.c
 debug: clift.c
 	$(CC) -g -o clift clift.c -lm
 
-# additionally compiles with OpenMP, allowing multithreaded clifts
-# make sure to also enable multiple threads when cliftning, e.g.:
-# OMP_NUM_THREADS=4 ./clift out/model.bin
-.PHONY: omp
-omp: clift.c
-	$(HOMEBREW_CLANG) $(HOMEBREW_FLAGS) -O3 -ffast-math -fno-omit-frame-pointer -Wall -fopenmp -march=native clift.c  -lm  -o clift
+# additionally compiles with OpenMP, allowing multithreaded clift
+.PHONY: brewmp
+brewmp: clift.c
+	$(HOMEBREW_CLANG) $(HOMEBREW_FLAGS) -O3 -ffast-math -fno-omit-frame-pointer -Wall -fopenmp -march=native clift.c -lm -o clift
 
 # compiles with gnu99 standard flags for amazon linux, coreos, etc. compatibility
-.PHONY: cliftgnu
-gnu:
-	$(CC) -Ofast -std=gnu11 -o clift clift.c -lm
-
-.PHONY: cliftompgnu
-ompgnu:
-	$(CC) -Ofast -fopenmp -std=gnu11 clift.c  -lm  -o clift
+.PHONY: omp
+omp: clift.c
+	$(CC) -O3 -ffast-math -fno-omit-frame-pointer -Wall -fopenmp -march=native clift.c  -lm  -o clift
 
 .PHONY: clean
 clean:
