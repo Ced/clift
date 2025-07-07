@@ -144,9 +144,8 @@ typedef struct {
                        //  chunk_len][head_dim]
   float* mha_score;    // [kv_head_count][q_head_per_kv_head_count][
                        //  chunk_len][context_len]
-  float* mha_blend;    // [kv_head_count][q_head_per_kv_head_count][
-                       //  chunk_len][head_dim]
-  float* mha_att;      // [chunk_len][embedding_dim]
+  float* mha_att;      // [chunk_len][kv_head_count][q_head_per_kv_head_count][
+                       //  head_dim] also seen as [chunk_len][embedding_dim]
   float* mha_out;      // [chunk_len][embedding_dim]
   float* ffn_norm;     // [chunk_len][embedding_dim]
   float* ffn_fc;       // [chunk_len][hidden_dim]
@@ -158,7 +157,21 @@ typedef struct {
   float* v_cache;      // [layer_count][kv_head_count][context_len][head_dim]
   // Utility variables
   float* rope_cos_sin; // [context_len][head_dim]
+  // Temporary, array-expanded variables (were loop-private variables)
+  float* mha_ss;       // [chunk_len]
+  float* mha_k0;       // [kv_head_count][chunk_len][head_dim]
+  float* mha_q0;       // [kv_head_count][q_head_per_kv_head_count][
+                       //  chunk_len][head_dim]
+  float* mha_max;      // [kv_head_count][q_head_per_kv_head_count][chunk_len]
+  float* mha_sum;      // [kv_head_count][q_head_per_kv_head_count][chunk_len]
+  float* ffn_ss;       // [chunk_len]
+  float* out_ss;       // [chunk_len]
 } state_t;
+
+typedef enum {
+  IMPLEMENTATION_BASIC,  // Basic implementation
+  IMPLEMENTATION_INLINED // Inlined implementation
+} implementation_t;
 
 typedef struct {
   configuration_t config; // Hyperparameters
@@ -167,6 +180,7 @@ typedef struct {
   int fd;                 // File descriptor for memory mapping
   float* data;            // Memory mapped data pointer
   ssize_t file_size;      // Size of the checkpoint file in bytes
+  implementation_t impl;  // Implementation type
 } transformer_t;
 
 void state_malloc(state_t* s, configuration_t* p) {
@@ -178,12 +192,16 @@ void state_malloc(state_t* s, configuration_t* p) {
   size_t cache_len = p->context_len * p->layer_count * kv_dim;
   size_t logits_len = SEQUENCE_CHUNK_MAX_LEN * p->vocabulary_len;
   size_t rope_len = p->context_len * head_dim;
+  size_t ss_len = SEQUENCE_CHUNK_MAX_LEN;
+  size_t k0_len = p->kv_head_count * SEQUENCE_CHUNK_MAX_LEN * head_dim;
+  size_t q0_len = SEQUENCE_CHUNK_MAX_LEN * p->embedding_dim;
+  size_t max_len = p->q_head_count * SEQUENCE_CHUNK_MAX_LEN;
+  size_t sum_len = p->q_head_count * SEQUENCE_CHUNK_MAX_LEN;
 
   s->embedding = calloc(embedding_len, sizeof(*s->embedding));
   s->mha_norm = calloc(embedding_len, sizeof(*s->mha_norm));
   s->mha_q = calloc(embedding_len, sizeof(*s->mha_q));
   s->mha_score = calloc(score_len, sizeof(*s->mha_score));
-  s->mha_blend = calloc(embedding_len, sizeof(*s->mha_blend));
   s->mha_att = calloc(embedding_len, sizeof(*s->mha_att));
   s->mha_out = calloc(embedding_len, sizeof(*s->mha_out));
   s->ffn_norm = calloc(embedding_len, sizeof(*s->ffn_norm));
@@ -194,13 +212,19 @@ void state_malloc(state_t* s, configuration_t* p) {
   s->k_cache = calloc(cache_len, sizeof(*s->k_cache));
   s->v_cache = calloc(cache_len, sizeof(*s->v_cache));
   s->rope_cos_sin = calloc(rope_len, sizeof(*s->rope_cos_sin));
+  s->mha_ss = calloc(ss_len, sizeof(*s->mha_ss));
+  s->mha_k0 = calloc(k0_len, sizeof(*s->mha_k0));
+  s->mha_q0 = calloc(q0_len, sizeof(*s->mha_q0));
+  s->mha_max = calloc(max_len, sizeof(*s->mha_max));
+  s->mha_sum = calloc(sum_len, sizeof(*s->mha_sum));
+  s->ffn_ss = calloc(ss_len, sizeof(*s->ffn_ss));
+  s->out_ss = calloc(ss_len, sizeof(*s->out_ss));
 
   // Ensure all mallocs went fine
   if (!s->embedding ||
       !s->mha_norm ||
       !s->mha_q ||
       !s->mha_score ||
-      !s->mha_blend ||
       !s->mha_att ||
       !s->mha_out ||
       !s->ffn_norm ||
@@ -210,7 +234,14 @@ void state_malloc(state_t* s, configuration_t* p) {
       !s->logits ||
       !s->k_cache ||
       !s->v_cache ||
-      !s->rope_cos_sin) {
+      !s->rope_cos_sin ||
+      !s->mha_ss ||
+      !s->mha_k0 ||
+      !s->mha_q0 ||
+      !s->mha_max ||
+      !s->mha_sum ||
+      !s->ffn_ss ||
+      !s->out_ss) {
     fprintf(stderr, "malloc failed!\n");
     exit(EXIT_FAILURE);
   }
@@ -231,7 +262,6 @@ void state_free(state_t* s) {
   free(s->mha_norm);
   free(s->mha_q);
   free(s->mha_score);
-  free(s->mha_blend);
   free(s->mha_att);
   free(s->mha_out);
   free(s->ffn_norm);
@@ -242,6 +272,13 @@ void state_free(state_t* s) {
   free(s->k_cache);
   free(s->v_cache);
   free(s->rope_cos_sin);
+  free(s->mha_ss);
+  free(s->mha_k0);
+  free(s->mha_q0);
+  free(s->mha_max);
+  free(s->mha_sum);
+  free(s->ffn_ss);
+  free(s->out_ss);
 }
 
 void parameter_set_mmap(
@@ -430,283 +467,8 @@ void rope(
   }
 }
 
-void transformer_forward(
-    int sequence_len,
-    int* sequence,
-    int vocabulary_len,
-    int context_len,
-    int layer_count,
-    int q_head_count,
-    int kv_head_count,
-    int q_head_per_kv_head_count,
-    int embedding_dim,
-    int head_dim,
-    int q_dim,
-    int kv_dim,
-    int hidden_dim,
-
-    float epsilon,
-
-    float embedding_weight[restrict vocabulary_len][embedding_dim],
-    float mha_norm_weight[restrict layer_count][embedding_dim],
-    float mha_q_weight[restrict layer_count][kv_head_count]
-                      [q_head_per_kv_head_count][head_dim][embedding_dim],
-    float mha_k_weight[restrict layer_count][kv_head_count][head_dim]
-                      [embedding_dim],
-    float mha_v_weight[restrict layer_count][kv_head_count][head_dim]
-                      [embedding_dim],
-    float mha_out_weight[restrict layer_count][embedding_dim][embedding_dim],
-    float ffn_norm_weight[restrict layer_count][embedding_dim],
-    float ffn_fc_weight[restrict layer_count][hidden_dim][embedding_dim],
-    float ffn_up_weight[restrict layer_count][hidden_dim][embedding_dim],
-    float ffn_out_weight[restrict layer_count][embedding_dim][hidden_dim],
-    float out_norm_weight[restrict embedding_dim],
-    float out_weight[restrict vocabulary_len][embedding_dim],
-
-    float embedding[restrict SEQUENCE_CHUNK_MAX_LEN][embedding_dim],
-    float mha_norm[restrict SEQUENCE_CHUNK_MAX_LEN][embedding_dim],
-    float mha_q[restrict kv_head_count][q_head_per_kv_head_count]
-               [SEQUENCE_CHUNK_MAX_LEN][head_dim],
-    float k_cache[restrict layer_count][kv_head_count][context_len][head_dim],
-    float v_cache[restrict layer_count][kv_head_count][context_len][head_dim],
-    float rope_cos_sin[restrict context_len][head_dim],
-    float mha_score[restrict kv_head_count][q_head_per_kv_head_count]
-                   [SEQUENCE_CHUNK_MAX_LEN][context_len],
-    float mha_blend[restrict kv_head_count][q_head_per_kv_head_count]
-                   [SEQUENCE_CHUNK_MAX_LEN][head_dim],
-    float mha_att[restrict SEQUENCE_CHUNK_MAX_LEN][embedding_dim],
-    float mha_out[restrict SEQUENCE_CHUNK_MAX_LEN][embedding_dim],
-    float ffn_norm[restrict SEQUENCE_CHUNK_MAX_LEN][embedding_dim],
-    float ffn_fc[restrict SEQUENCE_CHUNK_MAX_LEN][hidden_dim],
-    float ffn_up[restrict SEQUENCE_CHUNK_MAX_LEN][hidden_dim],
-    float ffn_out[restrict SEQUENCE_CHUNK_MAX_LEN][embedding_dim],
-    float logits[restrict SEQUENCE_CHUNK_MAX_LEN][vocabulary_len],
-    int past,
-    int logits_count
-) {
-  // Get embedding representation of each token in the token sequence
-  for (int t = 0; t < sequence_len; t++) {
-    for (int e = 0; e < embedding_dim; e++) {
-      embedding[t][e] = embedding_weight[sequence[t]][e];
-    }
-  }
-
-  // Forward all the layers
-  for (int l = 0; l < layer_count; l++) {
-
-    // Attention rmsnorm
-    rmsnorm(
-        sequence_len,
-        embedding_dim,
-        mha_norm,
-        embedding,
-        mha_norm_weight[l],
-        epsilon
-    );
-
-    // QKV matmuls for this position
-    for (int h = 0; h < kv_head_count; h++) {
-      for (int g = 0; g < q_head_per_kv_head_count; g++) {
-        matmul(
-            sequence_len,
-            head_dim,
-            embedding_dim,
-            mha_q[h][g],
-            mha_norm,
-            mha_q_weight[l][h][g]
-        );
-      }
-    }
-
-    for (int h = 0; h < kv_head_count; h++) {
-      matmul(
-          sequence_len,
-          head_dim,
-          embedding_dim,
-          k_cache[l][h] + past,
-          mha_norm,
-          mha_k_weight[l][h]
-      );
-    }
-    
-    for (int h = 0; h < kv_head_count; h++) {
-      matmul(
-          sequence_len,
-          head_dim,
-          embedding_dim,
-          v_cache[l][h] + past,
-          mha_norm,
-          mha_v_weight[l][h]
-      );
-    }
-
-    // RoPE q: complex-valued rotate q in each head
-    for (int h = 0; h < kv_head_count; h++) {
-      for (int g = 0; g < q_head_per_kv_head_count; g++) {
-        rope(
-          context_len,
-          sequence_len,
-          head_dim,
-          mha_q[h][g],
-          rope_cos_sin,
-          past
-        );
-      }
-    }
-
-    // RoPE k: complex-valued rotate k in each head
-    for (int h = 0; h < kv_head_count; h++) {
-      rope(
-          context_len,
-          sequence_len,
-          head_dim,
-          k_cache[l][h] + past,
-          rope_cos_sin,
-          past
-      );
-    }
-
-    // Multihead attention. iterate over all heads
-    for (int h = 0; h < kv_head_count; h++) {
-      for (int g = 0; g < q_head_per_kv_head_count; g++) {
-        for (int t = 0; t < sequence_len; t++) {
-          // Iterate over all timesteps, including the current one and
-          // calculate the attention score as the dot product of q and k
-          for (int p = 0; p <= past + t; p++) {
-            mha_score[h][g][t][p] = 0.0f;
-            for (int e = 0; e < head_dim; e++) {
-              mha_score[h][g][t][p] += mha_q[h][g][t][e] * k_cache[l][h][p][e];
-            }
-            mha_score[h][g][t][p] /= sqrtf(head_dim);
-          }
-        }
-
-        // Softmax the scores to get attention weights
-        softmax(sequence_len, past, context_len, mha_score[h][g]);
-
-        for (int t = 0; t < sequence_len; t++) {
-          // Weighted sum of the values
-          for (int e = 0; e < head_dim; e++) {
-            mha_blend[h][g][t][e] = 0.0f;
-          }
-          for (int p = 0; p <= past + t; p++) {
-            for (int e = 0; e < head_dim; e++) {
-              mha_blend[h][g][t][e] +=
-                  mha_score[h][g][t][p] * v_cache[l][h][p][e];
-            }
-          }
-        }
-      }
-    }
-
-    for (int h = 0; h < kv_head_count; h++) {
-      for (int g = 0; g < q_head_per_kv_head_count; g++) {
-        for (int t = 0; t < sequence_len; t++) {
-          for (int e = 0; e < head_dim; e++) {
-            mha_att[t][(h * q_head_per_kv_head_count + g) * head_dim + e] =
-                mha_blend[h][g][t][e];
-          }
-        }
-      }
-    }
-
-    // Final matmul to get the output of the attention
-    matmul(
-        sequence_len,
-        embedding_dim,
-        embedding_dim,
-        mha_out,
-        mha_att,
-        mha_out_weight[l]
-    );
-
-    // Residual connection back into x
-    for (int t = 0; t < sequence_len; t++) {
-      for (int e = 0; e < embedding_dim; e++) {
-        embedding[t][e] += mha_out[t][e];
-      }
-    }
-
-    // FFN rmsnorm
-    rmsnorm(
-        sequence_len,
-        embedding_dim,
-        ffn_norm,
-        embedding,
-        ffn_norm_weight[l],
-        epsilon
-    );
-
-    // Now for FFN in PyTorch we have:
-    // ffn_out_weight(F.silu(ffn_fc_weight(x)) * ffn_up_weight(x))
-    // First calculate ffn_fc_weight(x) and ffn_up_weight(x)
-    matmul(
-        sequence_len,
-        hidden_dim,
-        embedding_dim,
-        ffn_fc,
-        ffn_norm,
-        ffn_fc_weight[l]
-    );
-    matmul(
-        sequence_len,
-        hidden_dim,
-        embedding_dim,
-        ffn_up,
-        ffn_norm,
-        ffn_up_weight[l]
-    );
-
-    // SwiGLU non-linearity
-    for (int t = 0; t < sequence_len; t++) {
-      for (int e = 0; e < hidden_dim; e++) {
-        // SiLU(x)=x*σ(x), where σ(x) is the logistic sigmoid
-        ffn_fc[t][e] *= (1.0f / (1.0f + expf(-ffn_fc[t][e])));
-        // Elementwise multiply with ffn_up_weight(x)
-        ffn_fc[t][e] *= ffn_up[t][e];
-      }
-    }
-
-    // Final matmul to get the output of the ffn
-    matmul(
-        sequence_len,
-        embedding_dim,
-        hidden_dim,
-        ffn_out,
-        ffn_fc,
-        ffn_out_weight[l]
-    );
-
-    // Residual connection
-    for (int t = 0; t < sequence_len; t++) {
-      for (int e = 0; e < embedding_dim; e++) {
-        embedding[t][e] += ffn_out[t][e];
-      }
-    }
-  }
-
-  // Final rmsnorm
-  rmsnorm(
-      sequence_len,
-      embedding_dim,
-      embedding,
-      embedding,
-      out_norm_weight,
-      epsilon
-  );
-
-  // Classifier into logits
-  matmul(
-      logits_count,
-      vocabulary_len,
-      embedding_dim,
-      logits + sequence_len - logits_count,
-      embedding + sequence_len - logits_count,
-      out_weight
-  );
-}
-
-void transformer_forward_inlined(
+// Basic transformer implementation using basic operators
+void transformer_basic(
     int token_count,
     int* token,
     int vocabulary_len,
@@ -748,9 +510,8 @@ void transformer_forward_inlined(
     float rope_cos_sin[restrict context_len][head_dim],
     float mha_score[restrict kv_head_count][q_head_per_kv_head_count]
                    [SEQUENCE_CHUNK_MAX_LEN][context_len],
-    float mha_blend[restrict kv_head_count][q_head_per_kv_head_count]
-                   [SEQUENCE_CHUNK_MAX_LEN][head_dim],
-    float mha_att[restrict SEQUENCE_CHUNK_MAX_LEN][embedding_dim],
+    float mha_att[restrict SEQUENCE_CHUNK_MAX_LEN][kv_head_count]
+                 [q_head_per_kv_head_count][head_dim],
     float mha_out[restrict SEQUENCE_CHUNK_MAX_LEN][embedding_dim],
     float ffn_norm[restrict SEQUENCE_CHUNK_MAX_LEN][embedding_dim],
     float ffn_fc[restrict SEQUENCE_CHUNK_MAX_LEN][hidden_dim],
@@ -760,7 +521,294 @@ void transformer_forward_inlined(
     int past,
     int logits_count
 ) {
-  // Get embedding representation of each token in the token sequence
+  // Convert token ids to embedding vector representation
+  for (int t = 0; t < token_count; t++) {
+    for (int e = 0; e < embedding_dim; e++) {
+      embedding[t][e] = embedding_weight[token[t]][e];
+    }
+  }
+
+  // Execute decoder layers
+  for (int l = 0; l < layer_count; l++) {
+
+    // Attention rmsnorm: normalize the embedding vectors for the current layer
+    rmsnorm(
+        token_count,
+        embedding_dim,
+        mha_norm,
+        embedding,
+        mha_norm_weight[l],
+        epsilon
+    );
+
+    // Q matmul for all Q-heads
+    for (int k = 0; k < kv_head_count; k++) {
+      for (int q = 0; q < q_head_per_kv_head_count; q++) {
+        matmul(
+            token_count,
+            head_dim,
+            embedding_dim,
+            mha_q[k][q],
+            mha_norm,
+            mha_q_weight[l][k][q]
+        );
+      }
+    }
+
+    // K matmul for all KV-heads, storing in the k_cache
+    for (int k = 0; k < kv_head_count; k++) {
+      matmul(
+          token_count,
+          head_dim,
+          embedding_dim,
+          k_cache[l][k] + past,
+          mha_norm,
+          mha_k_weight[l][k]
+      );
+    }
+
+    // V matmul for all KV-heads, storing in the v_cache
+    for (int k = 0; k < kv_head_count; k++) {
+      matmul(
+          token_count,
+          head_dim,
+          embedding_dim,
+          v_cache[l][k] + past,
+          mha_norm,
+          mha_v_weight[l][k]
+      );
+    }
+
+    // RoPE Q for all Q-heads: complex-valued rotate Q in each head
+    for (int k = 0; k < kv_head_count; k++) {
+      for (int q = 0; q < q_head_per_kv_head_count; q++) {
+        rope(
+          context_len,
+          token_count,
+          head_dim,
+          mha_q[k][q],
+          rope_cos_sin,
+          past
+        );
+      }
+    }
+
+    // RoPE K for all KV-heads: complex-valued rotate K in each head
+    for (int k = 0; k < kv_head_count; k++) {
+      rope(
+          context_len,
+          token_count,
+          head_dim,
+          k_cache[l][k] + past,
+          rope_cos_sin,
+          past
+      );
+    }
+
+    // Multihead attention. iterate over all Q-heads
+    for (int k = 0; k < kv_head_count; k++) {
+      for (int q = 0; q < q_head_per_kv_head_count; q++) {
+        for (int t = 0; t < token_count; t++) {
+          // Calculate the attention score: QKˆT / sqrt(head_dim)
+          // Here we don't use mask but a triangular loop (no compute
+          // for future tokens)
+          for (int p = 0; p < past + t + 1; p++) {
+            mha_score[k][q][t][p] = 0.0f;
+            for (int h = 0; h < head_dim; h++) {
+              mha_score[k][q][t][p] += mha_q[k][q][t][h] * k_cache[l][k][p][h];
+            }
+            mha_score[k][q][t][p] /= sqrtf(head_dim);
+          }
+        }
+
+        // Softmax the scores to get attention weights
+        softmax(token_count, past, context_len, mha_score[k][q]);
+
+        for (int t = 0; t < token_count; t++) {
+          // Weighted sum of the values, here the access function of
+          // mha_att is to please the output matmul
+          for (int h = 0; h < head_dim; h++) {
+            mha_att[t][k][q][h] = 0.0f;
+          }
+          for (int p = 0; p <= past + t; p++) {
+            for (int h = 0; h < head_dim; h++) {
+              mha_att[t][k][q][h] +=
+                  mha_score[k][q][t][p] * v_cache[l][k][p][h];
+            }
+          }
+        }
+      }
+    }
+  
+    // Final matmul to get the output of the attention
+    // Note mha_att[t][k][q][h] is replaced by mha_att[t][e] with
+    // 0 < e < embedding_dim (consecutive data) 
+    matmul(
+        token_count,
+        embedding_dim,
+        embedding_dim,
+        mha_out,
+        (float (*)[embedding_dim])mha_att,
+        mha_out_weight[l]
+    );
+
+    // Residual connection back into x
+    for (int t = 0; t < token_count; t++) {
+      for (int e = 0; e < embedding_dim; e++) {
+        embedding[t][e] += mha_out[t][e];
+      }
+    }
+
+    // Feed-forward network's rmsnorm
+    rmsnorm(
+        token_count,
+        embedding_dim,
+        ffn_norm,
+        embedding,
+        ffn_norm_weight[l],
+        epsilon
+    );
+
+    // Feed-forward's fully-connected matmul (a.k.a. gate)
+    matmul(
+        token_count,
+        hidden_dim,
+        embedding_dim,
+        ffn_fc,
+        ffn_norm,
+        ffn_fc_weight[l]
+    );
+
+    // Feed-forward's up matmul
+    matmul(
+        token_count,
+        hidden_dim,
+        embedding_dim,
+        ffn_up,
+        ffn_norm,
+        ffn_up_weight[l]
+    );
+
+    // SwiGLU non-linearity
+    for (int t = 0; t < token_count; t++) {
+      for (int e = 0; e < hidden_dim; e++) {
+        // SiLU(x)=x*σ(x), where σ(x) is the logistic sigmoid
+        ffn_fc[t][e] *= (1.0f / (1.0f + expf(-ffn_fc[t][e])));
+        // Elementwise multiply with ffn_up_weight(x)
+        ffn_fc[t][e] *= ffn_up[t][e];
+      }
+    }
+
+    // Final matmul to get the output of the feed-forward network
+    matmul(
+        token_count,
+        embedding_dim,
+        hidden_dim,
+        ffn_out,
+        ffn_fc,
+        ffn_out_weight[l]
+    );
+
+    // Residual connection
+    for (int t = 0; t < token_count; t++) {
+      for (int e = 0; e < embedding_dim; e++) {
+        embedding[t][e] += ffn_out[t][e];
+      }
+    }
+  }
+
+  // Final rmsnorm
+  rmsnorm(
+      token_count,
+      embedding_dim,
+      embedding,
+      embedding,
+      out_norm_weight,
+      epsilon
+  );
+
+  // Classifier into logits
+  matmul(
+      logits_count,
+      vocabulary_len,
+      embedding_dim,
+      logits + token_count - logits_count,
+      embedding + token_count - logits_count,
+      out_weight
+  );
+}
+
+// Transformer function designed for (polyhedral) compiler optimization:
+// operators have been inlined and loop-private variable have beed replaced
+// with expanded arrays. Loop and array dimensions are adapted to expose
+// parallelism and vectorization opportunities.
+void transformer_inlined(
+    int token_count,
+    int* token,
+    int vocabulary_len,
+    int context_len,
+    int layer_count,
+    int q_head_count,
+    int kv_head_count,
+    int q_head_per_kv_head_count,
+    int embedding_dim,
+    int head_dim,
+    int q_dim,
+    int kv_dim,
+    int hidden_dim,
+
+    float epsilon,
+
+    float embedding_weight[restrict vocabulary_len][embedding_dim],
+    float mha_norm_weight[restrict layer_count][embedding_dim],
+    float mha_q_weight[restrict layer_count][kv_head_count]
+                      [q_head_per_kv_head_count][head_dim][embedding_dim],
+    float mha_k_weight[restrict layer_count][kv_head_count][head_dim]
+                      [embedding_dim],
+    float mha_v_weight[restrict layer_count][kv_head_count][head_dim]
+                      [embedding_dim],
+    float mha_out_weight[restrict layer_count][embedding_dim][kv_head_count]
+                      [q_head_per_kv_head_count][head_dim],
+    float ffn_norm_weight[restrict layer_count][embedding_dim],
+    float ffn_fc_weight[restrict layer_count][hidden_dim][embedding_dim],
+    float ffn_up_weight[restrict layer_count][hidden_dim][embedding_dim],
+    float ffn_out_weight[restrict layer_count][embedding_dim][hidden_dim],
+    float out_norm_weight[restrict embedding_dim],
+    float out_weight[restrict vocabulary_len][embedding_dim],
+
+    float embedding[restrict SEQUENCE_CHUNK_MAX_LEN][embedding_dim],
+    float mha_norm[restrict SEQUENCE_CHUNK_MAX_LEN][embedding_dim],
+    float mha_q[restrict kv_head_count][q_head_per_kv_head_count]
+               [SEQUENCE_CHUNK_MAX_LEN][head_dim],
+    float k_cache[restrict layer_count][kv_head_count][context_len][head_dim],
+    float v_cache[restrict layer_count][kv_head_count][context_len][head_dim],
+    float rope_cos_sin[restrict context_len][head_dim],
+    float mha_score[restrict kv_head_count][q_head_per_kv_head_count]
+                   [SEQUENCE_CHUNK_MAX_LEN][context_len],
+    float mha_att[restrict SEQUENCE_CHUNK_MAX_LEN][kv_head_count]
+                 [q_head_per_kv_head_count][head_dim],
+    float mha_out[restrict SEQUENCE_CHUNK_MAX_LEN][embedding_dim],
+    float ffn_norm[restrict SEQUENCE_CHUNK_MAX_LEN][embedding_dim],
+    float ffn_fc[restrict SEQUENCE_CHUNK_MAX_LEN][hidden_dim],
+    float ffn_up[restrict SEQUENCE_CHUNK_MAX_LEN][hidden_dim],
+    float ffn_out[restrict SEQUENCE_CHUNK_MAX_LEN][embedding_dim],
+    float logits[restrict SEQUENCE_CHUNK_MAX_LEN][vocabulary_len],
+    
+    float mha_ss[restrict SEQUENCE_CHUNK_MAX_LEN],
+    float mha_k0[restrict kv_head_count][SEQUENCE_CHUNK_MAX_LEN][head_dim],
+    float mha_q0[restrict kv_head_count][q_head_per_kv_head_count]
+                [SEQUENCE_CHUNK_MAX_LEN][head_dim],
+    float mha_max[restrict kv_head_count][q_head_per_kv_head_count]
+                 [SEQUENCE_CHUNK_MAX_LEN],
+    float mha_sum[restrict kv_head_count][q_head_per_kv_head_count]
+                 [SEQUENCE_CHUNK_MAX_LEN],
+    float ffn_ss[restrict SEQUENCE_CHUNK_MAX_LEN],
+    float out_ss[restrict SEQUENCE_CHUNK_MAX_LEN],
+
+    int past,
+    int logits_count
+) {
+  // Convert token ids to embedding vector representation
   #pragma omp for
   for (int t = 0; t < token_count; t++) {
     for (int e = 0; e < embedding_dim; e++) {
@@ -768,61 +816,67 @@ void transformer_forward_inlined(
     }
   }
 
-  // Forward all the layers
+  // Execute decoder layers
   for (int l = 0; l < layer_count; l++) {
 
-    // Attention rmsnorm
-    #pragma omp for
+    // Attention rmsnorm: normalize the embedding vectors for the current layer
+    #pragma omp for nowait
     for (int t = 0; t < token_count; t++) {
       // Calculate sum of squares
-      float ss = 0.0f;
+      mha_ss[t] = 0.0f;
       for (int e = 0; e < embedding_dim; e++) {
-        ss += embedding[t][e] * embedding[t][e];
+        mha_ss[t] += embedding[t][e] * embedding[t][e];
       }
-      ss /= embedding_dim;
-      ss += epsilon;
-      ss = 1.0f / sqrtf(ss);
+      mha_ss[t] /= embedding_dim;
+      mha_ss[t] += epsilon;
+      mha_ss[t] = 1.0f / sqrtf(mha_ss[t]);
       // Normalize and scale
       for (int e = 0; e < embedding_dim; e++) {
-        mha_norm[t][e] = mha_norm_weight[l][e] * (ss * embedding[t][e]);
+        mha_norm[t][e] = mha_norm_weight[l][e] * (mha_ss[t] * embedding[t][e]);
       }
     }
 
-    // QKV matmuls for this position
+    #pragma omp barrier
+
+    // K matmul for all KV-heads, storing in the k_cache
     #pragma omp for collapse(2) schedule(static) nowait
     for (int k = 0; k < kv_head_count; k++) {
       for (int t = 0; t < token_count; t++) {
         for (int h = 0; h < head_dim; h++) {
           k_cache[l][k][t + past][h] = 0.0f;
           for (int e = 0; e < embedding_dim; e++) {
-            k_cache[l][k][t + past][h] += mha_norm[t][e] * mha_k_weight[l][k][h][e];
+            k_cache[l][k][t + past][h] +=
+                mha_norm[t][e] * mha_k_weight[l][k][h][e];
           }
         }
       }
     }
 
-    // RoPE k: complex-valued rotate k in each head
+    // RoPE K for all KV-heads: complex-valued rotate K in each head
     #pragma omp for collapse(2) schedule(static) nowait
     for (int k = 0; k < kv_head_count; k++) {
       for (int t = 0; t < token_count; t++) {
         for (int h = 0; h < head_dim; h += 2) {
-          float fcr = rope_cos_sin[past + t][h + 0];
-          float fci = rope_cos_sin[past + t][h + 1];
-          float v0 = k_cache[l][k][t + past][h + 0];
-          float v1 = k_cache[l][k][t + past][h + 1];
-          k_cache[l][k][t + past][h + 0] = v0 * fcr - v1 * fci;
-          k_cache[l][k][t + past][h + 1] = v0 * fci + v1 * fcr;
+          mha_k0[k][t][h] = k_cache[l][k][t + past][h + 0];
+          k_cache[l][k][t + past][h + 0] =
+              rope_cos_sin[past + t][h + 0] * k_cache[l][k][t + past][h + 0] -
+              rope_cos_sin[past + t][h + 1] * k_cache[l][k][t + past][h + 1];
+          k_cache[l][k][t + past][h + 1] =
+              rope_cos_sin[past + t][h + 1] * mha_k0[k][t][h] +
+              rope_cos_sin[past + t][h + 0] * k_cache[l][k][t + past][h + 1];
         }
       }
     }
 
+    // V matmul for all KV-heads, storing in the v_cache
     #pragma omp for collapse(2) schedule(static) nowait
     for (int k = 0; k < kv_head_count; k++) {
       for (int t = 0; t < token_count; t++) {
         for (int h = 0; h < head_dim; h++) {
           v_cache[l][k][t + past][h] = 0.0f;
           for (int e = 0; e < embedding_dim; e++) {
-            v_cache[l][k][t + past][h] += mha_norm[t][e] * mha_v_weight[l][k][h][e];
+            v_cache[l][k][t + past][h] +=
+                mha_norm[t][e] * mha_v_weight[l][k][h][e];
           }
         }
       }
@@ -830,6 +884,7 @@ void transformer_forward_inlined(
 
     #pragma omp barrier
 
+    // Q matmul for all Q-heads
     #pragma omp for collapse(3) schedule(static) nowait
     for (int k = 0; k < kv_head_count; k++) {
       for (int q = 0; q < q_head_per_kv_head_count; q++) {
@@ -844,78 +899,70 @@ void transformer_forward_inlined(
       }
     }
 
-    // RoPE q: complex-valued rotate q in each head
+    // RoPE Q for all Q-heads: complex-valued rotate Q in each head
     #pragma omp for collapse(3) schedule(static) nowait
     for (int k = 0; k < kv_head_count; k++) {
       for (int q = 0; q < q_head_per_kv_head_count; q++) {
         for (int t = 0; t < token_count; t++) {
           for (int h = 0; h < head_dim; h += 2) {
-            float fcr = rope_cos_sin[past + t][h + 0];
-            float fci = rope_cos_sin[past + t][h + 1];
-            float v0 = mha_q[k][q][t][h + 0];
-            float v1 = mha_q[k][q][t][h + 1];
-            mha_q[k][q][t][h + 0] = v0 * fcr - v1 * fci;
-            mha_q[k][q][t][h + 1] = v0 * fci + v1 * fcr;
+            mha_q0[k][q][t][h] = mha_q[k][q][t][h + 0];
+            mha_q[k][q][t][h + 0] =
+                rope_cos_sin[past + t][h + 0] * mha_q[k][q][t][h + 0] -
+                rope_cos_sin[past + t][h + 1] * mha_q[k][q][t][h + 1];
+            mha_q[k][q][t][h + 1] =
+                rope_cos_sin[past + t][h + 1] * mha_q0[k][q][t][h] +
+                rope_cos_sin[past + t][h + 0] * mha_q[k][q][t][h + 1];
           }
         }
       }
     }
 
-    // Multihead attention. iterate over all heads
+    // Multihead attention. iterate over all Q-heads
     #pragma omp for collapse(3) schedule(static) nowait
     for (int k = 0; k < kv_head_count; k++) {
       for (int q = 0; q < q_head_per_kv_head_count; q++) {
         for (int t = 0; t < token_count; t++) {
-          // Iterate over all timesteps, including the current one and
-          // calculate the attention score as the dot product of q and k
+          // Calculate the attention score: QKˆT / sqrt(head_dim)
+          // Here we don't use mask but a triangular loop (no compute
+          // for future tokens)
           for (int s = 0; s < past + t + 1; s++) {
             mha_score[k][q][t][s] = 0.0f;
-            for (int e = 0; e < head_dim; e++) {
-              mha_score[k][q][t][s] += mha_q[k][q][t][e] * k_cache[l][k][s][e];
+            for (int h = 0; h < head_dim; h++) {
+              mha_score[k][q][t][s] += mha_q[k][q][t][h] * k_cache[l][k][s][h];
             }
             mha_score[k][q][t][s] /= sqrtf(head_dim);
           }
 
           // Softmax the scores to get attention weights
           // - Find max value (for numerical stability)
-          float max_val = mha_score[k][q][t][0];
+          mha_max[k][q][t] = mha_score[k][q][t][0];
           for (int s = 1; s < past + t + 1; s++) {
-            if (mha_score[k][q][t][s] > max_val) {
-              max_val = mha_score[k][q][t][s];
-            }
+            mha_max[k][q][t] = (mha_score[k][q][t][s] > mha_max[k][q][t])
+                                   ? mha_score[k][q][t][s]
+                                   : mha_max[k][q][t];
           }
           // - Exp and sum
-          float sum = 0.0f;
+          mha_sum[k][q][t] = 0.0f;
           for (int s = 0; s < past + t + 1; s++) {
-            mha_score[k][q][t][s] = expf(mha_score[k][q][t][s] - max_val);
-            sum += mha_score[k][q][t][s];
+            mha_score[k][q][t][s] =
+                expf(mha_score[k][q][t][s] - mha_max[k][q][t]);
+            mha_sum[k][q][t] += mha_score[k][q][t][s];
           }
           // - Normalize
           for (int s = 0; s < past + t + 1; s++) {
-            mha_score[k][q][t][s] /= sum;
+            mha_score[k][q][t][s] /= mha_sum[k][q][t];
           }
 
-          // Weighted sum of the values
-          for (int e = 0; e < head_dim; e++) {
-            mha_blend[k][q][t][e] = 0.0f;
+          // Weighted sum of the values, here the access function of
+          // mha_att is to please the output matmul
+          for (int h = 0; h < head_dim; h++) {
+            mha_att[t][k][q][h] = 0.0f;
           }
           for (int s = 0; s < past + t + 1; s++) {
-            for (int e = 0; e < head_dim; e++) {
-              mha_blend[k][q][t][e] +=
-                  mha_score[k][q][t][s] * v_cache[l][k][s][e];
+            for (int h = 0; h < head_dim; h++) {
+              mha_att[t][k][q][h] +=
+                  mha_score[k][q][t][s] * v_cache[l][k][s][h];
             }
-          }
-        }
-      }
-    }
-
-    #pragma omp for collapse(3) schedule(static) nowait
-    for (int k = 0; k < kv_head_count; k++) {
-      for (int q = 0; q < q_head_per_kv_head_count; q++) {
-        for (int t = 0; t < token_count; t++) {
-          for (int h = 0; h < head_dim; h++) {
-            mha_att[t][(k * q_head_per_kv_head_count + q) * head_dim + h] =
-                mha_blend[k][q][t][h];
           }
         }
       }
@@ -924,12 +971,19 @@ void transformer_forward_inlined(
     #pragma omp barrier
 
     // Final matmul to get the output of the attention
+    // Note k/q/h loops could be a single loop 0 < h < embedding_dim
+    // with accesses in [k][q][h] replaced by [h] (consecutive data) 
     #pragma omp for collapse(2) schedule(static) nowait
     for (int t = 0; t < token_count; t++) {
       for (int e = 0; e < embedding_dim; e++) {
         mha_out[t][e] = 0.0f;
-        for (int h = 0; h < embedding_dim; h++) {
-          mha_out[t][e] += mha_att[t][h] * mha_out_weight[l][e][h];
+        for (int k = 0; k < kv_head_count; k++) {
+          for (int q = 0; q < q_head_per_kv_head_count; q++) {
+            for (int h = 0; h < head_dim; h++) {
+              mha_out[t][e] +=
+                  mha_att[t][k][q][h] * mha_out_weight[l][e][k][q][h];
+            }
+          }
         }
       }
     }
@@ -944,26 +998,26 @@ void transformer_forward_inlined(
 
     #pragma omp barrier
 
-    // FFN rmsnorm
-    #pragma omp for
+    // Feed-forward network's rmsnorm
+    #pragma omp for nowait
     for (int i = 0; i < token_count; i++) {
       // Calculate sum of squares
-      float ss = 0.0f;
+      ffn_ss[i] = 0.0f;
       for (int j = 0; j < embedding_dim; j++) {
-        ss += embedding[i][j] * embedding[i][j];
+        ffn_ss[i] += embedding[i][j] * embedding[i][j];
       }
-      ss /= embedding_dim;
-      ss += epsilon;
-      ss = 1.0f / sqrtf(ss);
+      ffn_ss[i] /= embedding_dim;
+      ffn_ss[i] += epsilon;
+      ffn_ss[i] = 1.0f / sqrtf(ffn_ss[i]);
       // Normalize and scale
       for (int j = 0; j < embedding_dim; j++) {
-        ffn_norm[i][j] = ffn_norm_weight[l][j] * (ss * embedding[i][j]);
+        ffn_norm[i][j] = ffn_norm_weight[l][j] * (ffn_ss[i] * embedding[i][j]);
       }
     }
 
-    // Now for FFN in PyTorch we have:
-    // ffn_out_weight(F.silu(ffn_fc_weight(x)) * ffn_up_weight(x))
-    // First calculate ffn_fc_weight(x) and ffn_up_weight(x)
+    #pragma omp barrier
+
+    // Feed-forward's fully-connected matmul (a.k.a. gate)
     #pragma omp for collapse(2) schedule(static) nowait
     for (int t = 0; t < token_count; t++) {
       for (int h = 0; h < hidden_dim; h++) {
@@ -974,6 +1028,7 @@ void transformer_forward_inlined(
       }
     }
 
+    // Feed-forward's up matmul
     #pragma omp for collapse(2) schedule(static) nowait
     for (int t = 0; t < token_count; t++) {
       for (int h = 0; h < hidden_dim; h++) {
@@ -997,7 +1052,7 @@ void transformer_forward_inlined(
 
     #pragma omp barrier
 
-    // Final matmul to get the output of the ffn
+    // Final matmul to get the output of the feed-forward network
     #pragma omp for collapse(2) schedule(static) nowait
     for (int t = 0; t < token_count; t++) {
       for (int e = 0; e < embedding_dim; e++) {
@@ -1021,18 +1076,18 @@ void transformer_forward_inlined(
 
   // Final rmsnorm
   #pragma omp for
-  for (int i = 0; i < token_count; i++) {
+  for (int t = 0; t < token_count; t++) {
     // Calculate sum of squares
-    float ss = 0.0f;
-    for (int j = 0; j < embedding_dim; j++) {
-      ss += embedding[i][j] * embedding[i][j];
+    out_ss[t] = 0.0f;
+    for (int e = 0; e < embedding_dim; e++) {
+      out_ss[t] += embedding[t][e] * embedding[t][e];
     }
-    ss /= embedding_dim;
-    ss += epsilon;
-    ss = 1.0f / sqrtf(ss);
+    out_ss[t] /= embedding_dim;
+    out_ss[t] += epsilon;
+    out_ss[t] = 1.0f / sqrtf(out_ss[t]);
     // Normalize and scale
-    for (int j = 0; j < embedding_dim; j++) {
-      embedding[i][j] = out_norm_weight[j] * (ss * embedding[i][j]);
+    for (int e = 0; e < embedding_dim; e++) {
+      embedding[t][e] = out_norm_weight[e] * (out_ss[t] * embedding[t][e]);
     }
   }
 
@@ -1071,55 +1126,123 @@ void transformer_driver(
   int kv_dim = head_dim * kv_head_count;
   int hidden_dim = c->hidden_dim;
 
-  transformer_forward_inlined(
-      sequence_len,
-      sequence,
-      vocabulary_len,
-      context_len,
-      layer_count,
-      q_head_count,
-      kv_head_count,
-      q_head_per_kv_head_count,
-      embedding_dim,
-      head_dim,
-      q_dim,
-      kv_dim,
-      hidden_dim,
+  if (transformer->impl == IMPLEMENTATION_INLINED) {
+    transformer_inlined(
+        sequence_len,
+        sequence,
+        vocabulary_len,
+        context_len,
+        layer_count,
+        q_head_count,
+        kv_head_count,
+        q_head_per_kv_head_count,
+        embedding_dim,
+        head_dim,
+        q_dim,
+        kv_dim,
+        hidden_dim,
 
-      1e-5f,
+        1e-5f,
 
-      (float (*)[embedding_dim])p->embedding_weight,
-      (float (*)[embedding_dim])p->mha_norm_weight,
-      (float (*)[kv_head_count][q_head_per_kv_head_count][head_dim][embedding_dim])p->mha_q_weight,
-      (float (*)[kv_head_count][head_dim][embedding_dim])p->mha_k_weight,
-      (float (*)[kv_head_count][head_dim][embedding_dim])p->mha_v_weight,
-      (float (*)[embedding_dim][embedding_dim])p->mha_out_weight,
-      (float (*)[embedding_dim])p->ffn_norm_weight,
-      (float (*)[hidden_dim][embedding_dim])p->ffn_fc_weight,
-      (float (*)[hidden_dim][embedding_dim])p->ffn_up_weight,
-      (float (*)[embedding_dim][hidden_dim])p->ffn_out_weight,
-      (float (*))p->out_norm_weight,
-      (float (*)[embedding_dim])p->out_weight,
+        (float (*)[embedding_dim])p->embedding_weight,
+        (float (*)[embedding_dim])p->mha_norm_weight,
+        (float (*)[kv_head_count][q_head_per_kv_head_count][head_dim]
+                  [embedding_dim])p->mha_q_weight,
+        (float (*)[kv_head_count][head_dim][embedding_dim])p->mha_k_weight,
+        (float (*)[kv_head_count][head_dim][embedding_dim])p->mha_v_weight,
+        (float (*)[embedding_dim][kv_head_count][q_head_per_kv_head_count]
+                  [head_dim])p->mha_out_weight,
+        (float (*)[embedding_dim])p->ffn_norm_weight,
+        (float (*)[hidden_dim][embedding_dim])p->ffn_fc_weight,
+        (float (*)[hidden_dim][embedding_dim])p->ffn_up_weight,
+        (float (*)[embedding_dim][hidden_dim])p->ffn_out_weight,
+        (float(*))p->out_norm_weight,
+        (float (*)[embedding_dim])p->out_weight,
 
-      (float (*)[embedding_dim])s->embedding,
-      (float (*)[embedding_dim])s->mha_norm,
-      (float (*)[q_head_per_kv_head_count][SEQUENCE_CHUNK_MAX_LEN][head_dim])s->mha_q,
-      (float (*)[kv_head_count][context_len][head_dim])s->k_cache,
-      (float (*)[kv_head_count][context_len][head_dim])s->v_cache,
-      (float (*)[head_dim])s->rope_cos_sin,
-      (float (*)[q_head_per_kv_head_count][context_len][context_len])s->mha_score,
-      (float (*)[q_head_per_kv_head_count][SEQUENCE_CHUNK_MAX_LEN][embedding_dim])s->mha_blend,
-      (float (*)[embedding_dim])s->mha_att,
-      (float (*)[embedding_dim])s->mha_out,
-      (float (*)[embedding_dim])s->ffn_norm,
-      (float (*)[hidden_dim])s->ffn_fc,
-      (float (*)[hidden_dim])s->ffn_up,
-      (float (*)[embedding_dim])s->ffn_out,
-      (float (*)[vocabulary_len])s->logits,
+        (float (*)[embedding_dim])s->embedding,
+        (float (*)[embedding_dim])s->mha_norm,
+        (float (*)[q_head_per_kv_head_count][SEQUENCE_CHUNK_MAX_LEN]
+                  [head_dim])s->mha_q,
+        (float (*)[kv_head_count][context_len][head_dim])s->k_cache,
+        (float (*)[kv_head_count][context_len][head_dim])s->v_cache,
+        (float (*)[head_dim])s->rope_cos_sin,
+        (float (*)[q_head_per_kv_head_count][context_len]
+                  [context_len])s->mha_score,
+        (float (*)[kv_head_count][q_head_per_kv_head_count]
+                  [head_dim])s->mha_att,
+        (float (*)[embedding_dim])s->mha_out,
+        (float (*)[embedding_dim])s->ffn_norm,
+        (float (*)[hidden_dim])s->ffn_fc,
+        (float (*)[hidden_dim])s->ffn_up,
+        (float (*)[embedding_dim])s->ffn_out,
+        (float (*)[vocabulary_len])s->logits,
 
-      past,
-      logits_count
-  );
+        (float(*))s->mha_ss,
+        (float (*)[SEQUENCE_CHUNK_MAX_LEN][head_dim])s->mha_k0,
+        (float (*)[q_head_per_kv_head_count][SEQUENCE_CHUNK_MAX_LEN]
+                  [head_dim])s->mha_q0,
+        (float (*)[q_head_per_kv_head_count][SEQUENCE_CHUNK_MAX_LEN])s->mha_max,
+        (float (*)[q_head_per_kv_head_count][SEQUENCE_CHUNK_MAX_LEN])s->mha_sum,
+        (float(*))s->ffn_ss,
+        (float(*))s->out_ss,
+
+        past,
+        logits_count
+    );
+  } else {
+    transformer_basic(
+        sequence_len,
+        sequence,
+        vocabulary_len,
+        context_len,
+        layer_count,
+        q_head_count,
+        kv_head_count,
+        q_head_per_kv_head_count,
+        embedding_dim,
+        head_dim,
+        q_dim,
+        kv_dim,
+        hidden_dim,
+
+        1e-5f,
+
+        (float (*)[embedding_dim])p->embedding_weight,
+        (float (*)[embedding_dim])p->mha_norm_weight,
+        (float (*)[kv_head_count][q_head_per_kv_head_count][head_dim]
+                  [embedding_dim])p->mha_q_weight,
+        (float (*)[kv_head_count][head_dim][embedding_dim])p->mha_k_weight,
+        (float (*)[kv_head_count][head_dim][embedding_dim])p->mha_v_weight,
+        (float (*)[embedding_dim][embedding_dim])p->mha_out_weight,
+        (float (*)[embedding_dim])p->ffn_norm_weight,
+        (float (*)[hidden_dim][embedding_dim])p->ffn_fc_weight,
+        (float (*)[hidden_dim][embedding_dim])p->ffn_up_weight,
+        (float (*)[embedding_dim][hidden_dim])p->ffn_out_weight,
+        (float(*))p->out_norm_weight,
+        (float (*)[embedding_dim])p->out_weight,
+
+        (float (*)[embedding_dim])s->embedding,
+        (float (*)[embedding_dim])s->mha_norm,
+        (float (*)[q_head_per_kv_head_count][SEQUENCE_CHUNK_MAX_LEN]
+                  [head_dim])s->mha_q,
+        (float (*)[kv_head_count][context_len][head_dim])s->k_cache,
+        (float (*)[kv_head_count][context_len][head_dim])s->v_cache,
+        (float (*)[head_dim])s->rope_cos_sin,
+        (float (*)[q_head_per_kv_head_count][context_len]
+                  [context_len])s->mha_score,
+        (float (*)[kv_head_count][q_head_per_kv_head_count]
+                  [head_dim])s->mha_att,
+        (float (*)[embedding_dim])s->mha_out,
+        (float (*)[embedding_dim])s->ffn_norm,
+        (float (*)[hidden_dim])s->ffn_fc,
+        (float (*)[hidden_dim])s->ffn_up,
+        (float (*)[embedding_dim])s->ffn_out,
+        (float (*)[vocabulary_len])s->logits,
+
+        past,
+        logits_count
+    );
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -1649,7 +1772,7 @@ void generate(
   size_t chunk_len = MIN(remaining_sequence_len, SEQUENCE_CHUNK_MAX_LEN);
   start = time_in_ms();
 
-  #pragma omp parallel
+  #pragma omp parallel if(transformer->impl == IMPLEMENTATION_INLINED)
   {
     while (chunk_len != 0) {
       // We only compute the very last logits
@@ -1750,6 +1873,8 @@ void error_usage(char* argv[]) {
   fprintf(stderr, "Options:\n");
   fprintf(stderr, "  -f <path>       read prompt from file\n");
   fprintf(stderr, "  -h, --help      print usage and exit\n");
+  fprintf(stderr, "  --impl <impl>   implementation of the transformer:\n");
+  fprintf(stderr, "                  \"basic\" or \"inlined\" (default)\n");
   fprintf(stderr, "  -m <path>       model file (default model.bin)\n");
   fprintf(stderr, "  -n <int>        num of tokens to predict (default 256)\n");
   fprintf(stderr, "  -p <string>     input prompt\n");
@@ -1779,6 +1904,8 @@ int main(int argc, char* argv[]) {
   unsigned long long rng_seed = 0;
   // Set the number of threads to use for OpenMP
   int num_threads = 8;
+  // Implementation of the transformer, either basic or inlined
+  implementation_t impl = IMPLEMENTATION_INLINED;
 
   // Poor man's C argparse
   for (int i = 1; i < argc; i += 2) {
@@ -1790,6 +1917,19 @@ int main(int argc, char* argv[]) {
       }
     } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
       error_usage(argv);
+    } else if (strcmp(argv[i], "--impl") == 0) {
+      if (i + 1 < argc) {
+        if (strcmp(argv[i + 1], "basic") == 0) {
+          impl = IMPLEMENTATION_BASIC;
+        } else if (strcmp(argv[i + 1], "inlined") == 0) {
+          impl = IMPLEMENTATION_INLINED;
+        } else {
+          fprintf(stderr, "Unknown implementation: %s\n", argv[i + 1]);
+          exit(EXIT_FAILURE);
+        }
+      } else {
+        error_usage(argv);
+      }
     } else if (strcmp(argv[i], "-m") == 0) {
       if (i + 1 < argc) {
         checkpoint_path = argv[i + 1];
@@ -1892,6 +2032,7 @@ int main(int argc, char* argv[]) {
   // Build the transformer_t via the model .bin file
   transformer_t transformer;
   transformer_build(&transformer, checkpoint_path);
+  transformer.impl = impl;
 
   // Print configuration_t data
   fprintf(stderr, "transformer_t configuration:\n");
@@ -1905,6 +2046,11 @@ int main(int argc, char* argv[]) {
   fprintf(stderr, "runtime setup:\n");
   fprintf(stderr, "- seed:           %llu\n", rng_seed);
   fprintf(stderr, "- num_threads:    %d\n", num_threads);
+  fprintf(
+      stderr,
+      "- implementation: %s\n",
+      (transformer.impl == IMPLEMENTATION_BASIC) ? "basic" : "inlined"
+  );
   int vocabulary_len = transformer.config.vocabulary_len; 
 
   // Build the tokenizer_t via the tokenizer .bin file
