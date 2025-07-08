@@ -159,8 +159,8 @@ typedef struct {
   float* rope_cos_sin; // [context_len][head_dim]
   // Temporary, array-expanded variables (were loop-private variables)
   float* mha_ss;       // [chunk_len]
-  float* mha_k0;       // [kv_head_count][chunk_len][head_dim]
-  float* mha_q0;       // [kv_head_count][q_head_per_kv_head_count][
+  float* mha_k;        // [kv_head_count][chunk_len][head_dim]
+  float* mha_q_rope;   // [kv_head_count][q_head_per_kv_head_count][
                        //  chunk_len][head_dim]
   float* mha_max;      // [kv_head_count][q_head_per_kv_head_count][chunk_len]
   float* mha_sum;      // [kv_head_count][q_head_per_kv_head_count][chunk_len]
@@ -193,8 +193,8 @@ void state_malloc(state_t* s, configuration_t* p) {
   size_t logits_len = SEQUENCE_CHUNK_MAX_LEN * p->vocabulary_len;
   size_t rope_len = p->context_len * head_dim;
   size_t ss_len = SEQUENCE_CHUNK_MAX_LEN;
-  size_t k0_len = p->kv_head_count * SEQUENCE_CHUNK_MAX_LEN * head_dim;
-  size_t q0_len = SEQUENCE_CHUNK_MAX_LEN * p->embedding_dim;
+  size_t k_len = p->kv_head_count * SEQUENCE_CHUNK_MAX_LEN * head_dim;
+  size_t q_rope_len = SEQUENCE_CHUNK_MAX_LEN * p->embedding_dim;
   size_t max_len = p->q_head_count * SEQUENCE_CHUNK_MAX_LEN;
   size_t sum_len = p->q_head_count * SEQUENCE_CHUNK_MAX_LEN;
 
@@ -213,8 +213,8 @@ void state_malloc(state_t* s, configuration_t* p) {
   s->v_cache = calloc(cache_len, sizeof(*s->v_cache));
   s->rope_cos_sin = calloc(rope_len, sizeof(*s->rope_cos_sin));
   s->mha_ss = calloc(ss_len, sizeof(*s->mha_ss));
-  s->mha_k0 = calloc(k0_len, sizeof(*s->mha_k0));
-  s->mha_q0 = calloc(q0_len, sizeof(*s->mha_q0));
+  s->mha_k = calloc(k_len, sizeof(*s->mha_k));
+  s->mha_q_rope = calloc(q_rope_len, sizeof(*s->mha_q_rope));
   s->mha_max = calloc(max_len, sizeof(*s->mha_max));
   s->mha_sum = calloc(sum_len, sizeof(*s->mha_sum));
   s->ffn_ss = calloc(ss_len, sizeof(*s->ffn_ss));
@@ -236,8 +236,8 @@ void state_malloc(state_t* s, configuration_t* p) {
       !s->v_cache ||
       !s->rope_cos_sin ||
       !s->mha_ss ||
-      !s->mha_k0 ||
-      !s->mha_q0 ||
+      !s->mha_k ||
+      !s->mha_q_rope ||
       !s->mha_max ||
       !s->mha_sum ||
       !s->ffn_ss ||
@@ -273,8 +273,8 @@ void state_free(state_t* s) {
   free(s->v_cache);
   free(s->rope_cos_sin);
   free(s->mha_ss);
-  free(s->mha_k0);
-  free(s->mha_q0);
+  free(s->mha_k);
+  free(s->mha_q_rope);
   free(s->mha_max);
   free(s->mha_sum);
   free(s->ffn_ss);
@@ -795,9 +795,9 @@ void transformer_inlined(
     float logits[restrict SEQUENCE_CHUNK_MAX_LEN][vocabulary_len],
     
     float mha_ss[restrict SEQUENCE_CHUNK_MAX_LEN],
-    float mha_k0[restrict kv_head_count][SEQUENCE_CHUNK_MAX_LEN][head_dim],
-    float mha_q0[restrict kv_head_count][q_head_per_kv_head_count]
-                [SEQUENCE_CHUNK_MAX_LEN][head_dim],
+    float mha_k[restrict kv_head_count][SEQUENCE_CHUNK_MAX_LEN][head_dim],
+    float mha_q_rope[restrict kv_head_count][q_head_per_kv_head_count]
+                    [SEQUENCE_CHUNK_MAX_LEN][head_dim],
     float mha_max[restrict kv_head_count][q_head_per_kv_head_count]
                  [SEQUENCE_CHUNK_MAX_LEN],
     float mha_sum[restrict kv_head_count][q_head_per_kv_head_count]
@@ -843,10 +843,9 @@ void transformer_inlined(
     for (int k = 0; k < kv_head_count; k++) {
       for (int t = 0; t < token_count; t++) {
         for (int h = 0; h < head_dim; h++) {
-          k_cache[l][k][t + past][h] = 0.0f;
+          mha_k[k][t][h] = 0.0f;
           for (int e = 0; e < embedding_dim; e++) {
-            k_cache[l][k][t + past][h] +=
-                mha_norm[t][e] * mha_k_weight[l][k][h][e];
+            mha_k[k][t][h] += mha_norm[t][e] * mha_k_weight[l][k][h][e];
           }
         }
       }
@@ -856,14 +855,13 @@ void transformer_inlined(
     #pragma omp for collapse(2) schedule(static) nowait
     for (int k = 0; k < kv_head_count; k++) {
       for (int t = 0; t < token_count; t++) {
-        for (int h = 0; h < head_dim; h += 2) {
-          mha_k0[k][t][h] = k_cache[l][k][t + past][h + 0];
-          k_cache[l][k][t + past][h + 0] =
-              rope_cos_sin[past + t][h + 0] * k_cache[l][k][t + past][h + 0] -
-              rope_cos_sin[past + t][h + 1] * k_cache[l][k][t + past][h + 1];
-          k_cache[l][k][t + past][h + 1] =
-              rope_cos_sin[past + t][h + 1] * mha_k0[k][t][h] +
-              rope_cos_sin[past + t][h + 0] * k_cache[l][k][t + past][h + 1];
+        for (int h = 0; 2 * h < head_dim; h++) {
+          k_cache[l][k][past + t][2 * h + 0] =
+              rope_cos_sin[past + t][2 * h + 0] * mha_k[k][t][2 * h + 0] -
+              rope_cos_sin[past + t][2 * h + 1] * mha_k[k][t][2 * h + 1];
+          k_cache[l][k][past + t][2 * h + 1] =
+              rope_cos_sin[past + t][2 * h + 1] * mha_k[k][t][2 * h + 0] +
+              rope_cos_sin[past + t][2 * h + 0] * mha_k[k][t][2 * h + 1];
         }
       }
     }
@@ -904,14 +902,13 @@ void transformer_inlined(
     for (int k = 0; k < kv_head_count; k++) {
       for (int q = 0; q < q_head_per_kv_head_count; q++) {
         for (int t = 0; t < token_count; t++) {
-          for (int h = 0; h < head_dim; h += 2) {
-            mha_q0[k][q][t][h] = mha_q[k][q][t][h + 0];
-            mha_q[k][q][t][h + 0] =
-                rope_cos_sin[past + t][h + 0] * mha_q[k][q][t][h + 0] -
-                rope_cos_sin[past + t][h + 1] * mha_q[k][q][t][h + 1];
-            mha_q[k][q][t][h + 1] =
-                rope_cos_sin[past + t][h + 1] * mha_q0[k][q][t][h] +
-                rope_cos_sin[past + t][h + 0] * mha_q[k][q][t][h + 1];
+          for (int h = 0; 2 * h < head_dim; h++) {
+            mha_q_rope[k][q][t][2 * h + 0] =
+                rope_cos_sin[past + t][2 * h + 0] * mha_q[k][q][t][2 * h + 0] -
+                rope_cos_sin[past + t][2 * h + 1] * mha_q[k][q][t][2 * h + 1];
+            mha_q_rope[k][q][t][2 * h + 1] =
+                rope_cos_sin[past + t][2 * h + 1] * mha_q[k][q][t][2 * h + 0] +
+                rope_cos_sin[past + t][2 * h + 0] * mha_q[k][q][t][2 * h + 1];
           }
         }
       }
@@ -928,7 +925,8 @@ void transformer_inlined(
           for (int s = 0; s < past + t + 1; s++) {
             mha_score[k][q][t][s] = 0.0f;
             for (int h = 0; h < head_dim; h++) {
-              mha_score[k][q][t][s] += mha_q[k][q][t][h] * k_cache[l][k][s][h];
+              mha_score[k][q][t][s] +=
+                  mha_q_rope[k][q][t][h] * k_cache[l][k][s][h];
             }
             mha_score[k][q][t][s] /= sqrtf(head_dim);
           }
@@ -1178,9 +1176,9 @@ void transformer_driver(
         (float (*)[vocabulary_len])s->logits,
 
         (float(*))s->mha_ss,
-        (float (*)[SEQUENCE_CHUNK_MAX_LEN][head_dim])s->mha_k0,
+        (float (*)[SEQUENCE_CHUNK_MAX_LEN][head_dim])s->mha_k,
         (float (*)[q_head_per_kv_head_count][SEQUENCE_CHUNK_MAX_LEN]
-                  [head_dim])s->mha_q0,
+                  [head_dim])s->mha_q_rope,
         (float (*)[q_head_per_kv_head_count][SEQUENCE_CHUNK_MAX_LEN])s->mha_max,
         (float (*)[q_head_per_kv_head_count][SEQUENCE_CHUNK_MAX_LEN])s->mha_sum,
         (float(*))s->ffn_ss,
